@@ -256,10 +256,10 @@ class ServiceNowConnector(BaseConnector):
                 data_store_provider=self.data_store_provider,
             )
 
-        # Sync points for different entity types. Groups and roles have none:
-        # both reads must stay full, see _fetch_all_memberships.
+        # Sync points for different entity types. Groups, roles and knowledge
+        # bases have none: those three reads must stay full, see
+        # _fetch_all_memberships and _sync_knowledge_bases.
         self.user_sync_point = _create_sync_point(SyncDataPointType.USERS)
-        self.kb_sync_point = _create_sync_point(SyncDataPointType.RECORD_GROUPS)
         self.category_sync_point = _create_sync_point(SyncDataPointType.RECORD_GROUPS)
         self.article_sync_point = _create_sync_point(SyncDataPointType.RECORDS)
 
@@ -1675,22 +1675,17 @@ class ServiceNowConnector(BaseConnector):
             admin_users: List of admin users to grant explicit READ permissions
         """
         try:
-            # Get sync checkpoint for delta sync
-            last_sync_data = await self.kb_sync_point.read_sync_point(ServiceNowSyncPointKeys.KNOWLEDGE_BASES)
-            last_sync_time = (last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None)
-
-            if last_sync_time:
-                self.logger.info(f"🔄 Delta sync: Fetching KBs updated after {last_sync_time}")
-                query = f"{ServiceNowFields.SYS_UPDATED_ON}>{last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
-            else:
-                self.logger.info("🆕 Full sync: Fetching all knowledge bases")
-                query = ServiceNowQueryValues.ORDER_BY_UPDATED
+            # This read stays full. A knowledge base holds its read grants in
+            # kb_uc_can_read_mtom, and a change there does not touch
+            # kb_knowledge_base.sys_updated_on. A delta on the base row would
+            # therefore never see a new or a removed grant.
+            self.logger.info("Fetching all knowledge bases")
+            query = ServiceNowQueryValues.ORDER_BY_UPDATED
 
             # Pagination variables
             batch_size = ServiceNowDefaults.BATCH_SIZE
             offset = ServiceNowDefaults.PAGINATION_OFFSET
             total_synced = 0
-            latest_update_time = None
 
             # Paginate through all KBs
             while True:
@@ -1730,10 +1725,6 @@ class ServiceNowConnector(BaseConnector):
                 if not kbs_data:
                     self.logger.info("✅ No more knowledge bases to fetch")
                     break
-
-                # Track the latest update timestamp for checkpoint
-                if kbs_data:
-                    latest_update_time = kbs_data[-1].sys_updated_on
 
                 # Transform to RecordGroup entities
                 kb_record_groups = []
@@ -1801,10 +1792,6 @@ class ServiceNowConnector(BaseConnector):
                 # If this page has fewer records than batch_size, we're done
                 if len(kbs_data) < batch_size:
                     break
-
-            # Save checkpoint for next sync
-            if latest_update_time:
-                await self.kb_sync_point.update_sync_point(ServiceNowSyncPointKeys.KNOWLEDGE_BASES, {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_update_time})
 
             self.logger.info(f"✅ Knowledge base sync complete, Total synced: {total_synced}")
 
