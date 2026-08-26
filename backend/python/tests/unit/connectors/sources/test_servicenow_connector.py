@@ -12,6 +12,7 @@ from app.connectors.sources.servicenow.servicenow.constants import ORGANIZATIONA
 from app.connectors.sources.servicenow.servicenow.connector import ServiceNowConnector
 from app.models.entities import AppUser, AppUserGroup, FileRecord, RecordGroupType, RecordType, WebpageRecord
 from app.models.permission import EntityType, Permission, PermissionType
+from app.sources.client.servicenow.servicenow import ServiceNowRESTClientViaOAuthAuthorizationCode
 from app.sources.external.servicenow.models import (
     ServiceNowAPIError,
     SysUserGroup,
@@ -327,14 +328,20 @@ class TestGetFreshDatasource:
             await servicenow_connector._get_fresh_datasource()
 
     async def test_returns_datasource_with_fresh_token(self, servicenow_connector):
-        servicenow_connector.servicenow_client = MagicMock()
-        servicenow_connector.servicenow_client.access_token = "old-token"
+        """A real client, because the transport sends headers, not the attribute."""
+        client = ServiceNowRESTClientViaOAuthAuthorizationCode(
+            instance_url="https://dev194883.service-now.com",
+            client_id="cid", client_secret="secret",
+            redirect_uri="http://localhost/cb", access_token="old-token",
+        )
+        servicenow_connector.servicenow_client = client
         servicenow_connector.config_service.get_config = AsyncMock(return_value={
             "credentials": {"access_token": "new-token"},
         })
         ds = await servicenow_connector._get_fresh_datasource()
         assert ds is not None
-        assert servicenow_connector.servicenow_client.access_token == "new-token"
+        assert client.access_token == "new-token"
+        assert client.headers["Authorization"] == "Bearer new-token"
 
     async def test_no_config_raises(self, servicenow_connector):
         servicenow_connector.servicenow_client = MagicMock()
@@ -2870,3 +2877,25 @@ class TestArticleReadCriteriaOverride:
         )
 
         assert record.inherit_permissions is False
+
+
+# ===========================================================================
+# Token refresh reaches the transport
+# ===========================================================================
+
+class TestAccessTokenRefresh:
+    def test_set_access_token_rewrites_the_authorization_header(self):
+        """The transport sends headers, so a token written anywhere else is inert."""
+        client = ServiceNowRESTClientViaOAuthAuthorizationCode(
+            instance_url="https://dev194883.service-now.com",
+            client_id="cid",
+            client_secret="secret",
+            redirect_uri="http://localhost/cb",
+            access_token="first-token",
+        )
+        assert client.headers["Authorization"] == "Bearer first-token"
+
+        client.set_access_token("second-token")
+
+        assert client.access_token == "second-token"
+        assert client.headers["Authorization"] == "Bearer second-token"
