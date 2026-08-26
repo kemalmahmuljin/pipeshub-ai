@@ -671,15 +671,16 @@ class TestFetchAllGroups:
             result = await servicenow_connector._fetch_all_groups()
             assert result == []
 
-    async def test_api_failure(self, servicenow_connector):
+    async def test_api_failure_propagates(self, servicenow_connector):
+        """A partial group list would make the caller delete edges it cannot rebuild."""
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
             mock_datasource = AsyncMock()
             mock_datasource.get_now_table_tableName = AsyncMock(
                 side_effect=ServiceNowAPIError(500, "Error", None)
             )
             mock_ds.return_value = mock_datasource
-            result = await servicenow_connector._fetch_all_groups()
-            assert result == []
+            with pytest.raises(ServiceNowAPIError):
+                await servicenow_connector._fetch_all_groups()
 
 
 # ===========================================================================
@@ -1562,6 +1563,27 @@ class TestFetchAllGroupsDeep:
 # ===========================================================================
 
 class TestFetchAllMembershipsDeep:
+    @pytest.mark.asyncio
+    async def test_a_failed_page_does_not_yield_a_partial_membership_list(self, servicenow_connector):
+        """A partial list makes the caller delete edges it cannot rebuild."""
+        sync_point = AsyncMock()
+        sync_point.read_sync_point = AsyncMock(return_value=None)
+        sync_point.update_sync_point = AsyncMock()
+        servicenow_connector.group_sync_point = sync_point
+
+        full_page = _table_api_response([
+            {"sys_id": f"m{i}", "user": f"u{i}", "group": "g1", "sys_updated_on": "2026-08-01 10:00:00"}
+            for i in range(100)
+        ])
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(
+            side_effect=[full_page, ServiceNowAPIError(500, "page two failed", None)]
+        )
+        servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._fetch_all_memberships()
+
     async def test_paginates_memberships(self, servicenow_connector):
         page1 = [{"sys_id": f"m{i}", "user": f"u{i}", "group": "g1", "sys_updated_on": "2024-01-01"} for i in range(100)]
         page2 = [{"sys_id": "m100", "user": "u100", "group": "g1", "sys_updated_on": "2024-01-02"}]
@@ -1588,15 +1610,16 @@ class TestFetchAllMembershipsDeep:
 # ===========================================================================
 
     @pytest.mark.asyncio
-    async def test_fetch_all_memberships_api_error_breaks(self, servicenow_connector):
+    async def test_fetch_all_memberships_api_error_propagates(self, servicenow_connector):
+        """A partial membership list would silently remove users from their groups."""
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        result = await servicenow_connector._fetch_all_memberships()
-        assert result == []
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._fetch_all_memberships()
 
 
 class TestGetAdminUsersDeep:
@@ -2189,15 +2212,15 @@ class TestFlattenAndRoles:
         assert len(result) == 101
 
     @pytest.mark.asyncio
-    async def test_fetch_all_role_assignments_api_error(self, servicenow_connector):
+    async def test_fetch_all_role_assignments_api_error_propagates(self, servicenow_connector):
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        result = await servicenow_connector._fetch_all_role_assignments()
-        assert result == []
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._fetch_all_role_assignments()
 
     @pytest.mark.asyncio
     async def test_fetch_role_hierarchy_empty_results(self, servicenow_connector):
@@ -2209,26 +2232,26 @@ class TestFlattenAndRoles:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_fetch_role_hierarchy_api_error(self, servicenow_connector):
+    async def test_fetch_role_hierarchy_api_error_propagates(self, servicenow_connector):
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        result = await servicenow_connector._fetch_role_hierarchy()
-        assert result == []
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._fetch_role_hierarchy()
 
     @pytest.mark.asyncio
-    async def test_fetch_all_roles_api_error(self, servicenow_connector):
+    async def test_fetch_all_roles_api_error_propagates(self, servicenow_connector):
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        result = await servicenow_connector._fetch_all_roles()
-        assert result == []
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._fetch_all_roles()
 
 
 # ===========================================================================

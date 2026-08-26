@@ -1068,8 +1068,11 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
                     
-                except ServiceNowAPIError:
-                    break
+                except ServiceNowAPIError as e:
+                    # A partial list makes the caller delete permission edges that
+                    # it cannot rebuild, so stop the sync instead.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 if not response.result:
                     break
@@ -1130,8 +1133,11 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
                     
-                except ServiceNowAPIError:
-                    break
+                except ServiceNowAPIError as e:
+                    # A partial list makes the caller delete permission edges that
+                    # it cannot rebuild, so stop the sync instead.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 if not response.result:
                     break
@@ -1278,8 +1284,11 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
                     
-                except ServiceNowAPIError:
-                    break
+                except ServiceNowAPIError as e:
+                    # A partial list makes the caller delete permission edges that
+                    # it cannot rebuild, so stop the sync instead.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 if not response.result:
                     break
@@ -1339,8 +1348,11 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
-                except ServiceNowAPIError:
-                    break
+                except ServiceNowAPIError as e:
+                    # A partial list makes the caller delete permission edges that
+                    # it cannot rebuild, so stop the sync instead.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 if not response.result:
                     break
@@ -1397,8 +1409,11 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
                     
-                except ServiceNowAPIError:
-                    break
+                except ServiceNowAPIError as e:
+                    # A partial list makes the caller delete permission edges that
+                    # it cannot rebuild, so stop the sync instead.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 if not response.result:
                     break
