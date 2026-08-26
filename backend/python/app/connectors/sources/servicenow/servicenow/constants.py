@@ -142,6 +142,9 @@ class ServiceNowDefaults:
     # The out-of-box Knowledge Portal. Used only when the instance tells us nothing.
     KB_PORTAL_SUFFIX = "kb"
     KB_PORTAL_PROPERTY = "sn_km_portal.glide.knowman.serviceportal.portal_url"
+    # When true, an article's own Can Read criteria decide, and the grants of
+    # the parent knowledge base no longer reach that article.
+    ARTICLE_READ_CRITERIA_PROPERTY = "glide.knowman.apply_article_read_criteria"
 
 
 class ServiceNowConfigPaths:
