@@ -256,16 +256,12 @@ class ServiceNowConnector(BaseConnector):
                 data_store_provider=self.data_store_provider,
             )
 
-        # Sync points for different entity types
+        # Sync points for different entity types. Groups and roles have none:
+        # both reads must stay full, see _fetch_all_memberships.
         self.user_sync_point = _create_sync_point(SyncDataPointType.USERS)
-        self.group_sync_point = _create_sync_point(SyncDataPointType.GROUPS)
         self.kb_sync_point = _create_sync_point(SyncDataPointType.RECORD_GROUPS)
         self.category_sync_point = _create_sync_point(SyncDataPointType.RECORD_GROUPS)
         self.article_sync_point = _create_sync_point(SyncDataPointType.RECORDS)
-
-        # Role sync points (roles are represented as special user groups)
-        self.role_sync_point = _create_sync_point(SyncDataPointType.GROUPS)
-        self.role_assignment_sync_point = _create_sync_point(SyncDataPointType.GROUPS)
 
         # Organizational entity sync points
         self.company_sync_point = _create_sync_point(SyncDataPointType.GROUPS)
@@ -1095,26 +1091,23 @@ class ServiceNowConnector(BaseConnector):
 
 
     async def _fetch_all_memberships(self) -> List[SysUserGroupMembership]:
-        """Fetch all user-group memberships from ServiceNow
-        
+        """Fetch every user-group membership from ServiceNow.
+
+        This read must stay full. ``on_new_user_groups`` deletes all permission
+        edges that point to a group before it writes the members given to it, so
+        a delta read would drop every membership whose ``sys_user_grmember`` row
+        did not change inside the delta window.
+
         Returns:
             List of SysUserGroupMembership Pydantic models
         """
         try:
-            last_sync_data = await self.group_sync_point.read_sync_point(ServiceNowSyncPointKeys.GROUPS)
-            last_sync_time = (last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None)
-
-            if last_sync_time:
-                self.logger.info(f"🔄 Delta sync: fetching user memberships updated after {last_sync_time}")
-                query = f"{ServiceNowFields.SYS_UPDATED_ON}>{last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
-            else:
-                self.logger.info("🆕 Full sync: fetching all user memberships")
-                query = ServiceNowQueryValues.ORDER_BY_UPDATED
+            self.logger.info("Fetching all user memberships")
+            query = ServiceNowQueryValues.ORDER_BY_UPDATED
 
             all_memberships: List[SysUserGroupMembership] = []
             batch_size = ServiceNowDefaults.BATCH_SIZE
             offset = ServiceNowDefaults.PAGINATION_OFFSET
-            latest_update_time = None
 
             while True:
                 datasource = await self._get_fresh_datasource()
@@ -1145,8 +1138,6 @@ class ServiceNowConnector(BaseConnector):
 
                 # Parse records into Pydantic models
                 memberships = [SysUserGroupMembership(**record.model_dump()) for record in response.result]
-                latest_update_time = memberships[-1].sys_updated_on
-
                 all_memberships.extend(memberships)
                 offset += batch_size
 
@@ -1154,8 +1145,6 @@ class ServiceNowConnector(BaseConnector):
                     break
 
             self.logger.info(f"Fetched {len(all_memberships)} memberships")
-            if latest_update_time:
-                await self.group_sync_point.update_sync_point(ServiceNowSyncPointKeys.GROUPS, {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_update_time})
             return all_memberships
 
         except Exception as e:
@@ -1314,25 +1303,21 @@ class ServiceNowConnector(BaseConnector):
     async def _fetch_all_role_assignments(self) -> List[SysUserRoleAssignment]:
         """
         Fetch all user-role assignments from sys_user_has_role table.
-        
+
+        This read must stay full, for the reason given in
+        ``_fetch_all_memberships``: roles go through the same
+        ``on_new_user_groups`` replace-on-write path.
+
         Returns:
             List of SysUserRoleAssignment Pydantic models
         """
         try:
-            last_sync_data = await self.role_assignment_sync_point.read_sync_point(ServiceNowSyncPointKeys.ROLE_ASSIGNMENTS)
-            last_sync_time = last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None
-
-            if last_sync_time:
-                self.logger.info(f"🔄 Delta sync: fetching role assignments updated after {last_sync_time}")
-                query = f"state={ServiceNowFields.ACTIVE}^{ServiceNowFields.SYS_UPDATED_ON}>{last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
-            else:
-                self.logger.info("🆕 Full sync: fetching all active role assignments")
-                query = f"state={ServiceNowFields.ACTIVE}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
+            self.logger.info("Fetching all active role assignments")
+            query = f"state={ServiceNowFields.ACTIVE}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
 
             all_assignments: List[SysUserRoleAssignment] = []
             batch_size = ServiceNowDefaults.BATCH_SIZE
             offset = ServiceNowDefaults.PAGINATION_OFFSET
-            latest_update_time = None
 
             while True:
                 datasource = await self._get_fresh_datasource()
@@ -1363,17 +1348,10 @@ class ServiceNowConnector(BaseConnector):
                 # Parse records into Pydantic models
                 assignments = [SysUserRoleAssignment(**record.model_dump()) for record in response.result]
                 all_assignments.extend(assignments)
-                latest_update_time = assignments[-1].sys_updated_on
 
                 offset += batch_size
                 if len(assignments) < batch_size:
                     break
-
-            if latest_update_time:
-                await self.role_assignment_sync_point.update_sync_point(
-                    ServiceNowSyncPointKeys.ROLE_ASSIGNMENTS,
-                    {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_update_time}
-                )
 
             self.logger.info(f"Fetched {len(all_assignments)} role assignments")
             return all_assignments

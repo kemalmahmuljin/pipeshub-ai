@@ -223,9 +223,13 @@ class TestServiceNowConnectorInit:
 
     def test_sync_points_created(self, servicenow_connector):
         assert servicenow_connector.user_sync_point is not None
-        assert servicenow_connector.group_sync_point is not None
         assert servicenow_connector.kb_sync_point is not None
         assert servicenow_connector.article_sync_point is not None
+
+    def test_no_sync_point_for_groups_and_roles(self, servicenow_connector):
+        """Both reads must stay full, so neither may carry a checkpoint."""
+        assert not hasattr(servicenow_connector, "group_sync_point")
+        assert not hasattr(servicenow_connector, "role_assignment_sync_point")
 
     def test_org_entity_sync_points(self, servicenow_connector):
         for key in ["company", "department", "location", "cost_center"]:
@@ -682,11 +686,24 @@ class TestFetchAllGroups:
 # ===========================================================================
 
 class TestFetchAllMemberships:
-    async def test_fetches_memberships(self, servicenow_connector):
-        servicenow_connector.group_sync_point = AsyncMock()
-        servicenow_connector.group_sync_point.read_sync_point = AsyncMock(return_value=None)
-        servicenow_connector.group_sync_point.update_sync_point = AsyncMock()
+    @pytest.mark.asyncio
+    async def test_membership_query_carries_no_delta_even_with_a_sync_point(self, servicenow_connector):
+        """on_new_user_groups replaces every edge, so a delta read loses members."""
+        sync_point = AsyncMock()
+        sync_point.read_sync_point = AsyncMock(return_value={"last_sync_time": "2026-08-26 09:00:00"})
+        sync_point.update_sync_point = AsyncMock()
+        servicenow_connector.group_sync_point = sync_point
 
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(return_value=_table_api_response([]))
+        servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await servicenow_connector._fetch_all_memberships()
+
+        query = mock_ds.get_now_table_tableName.call_args.kwargs["sysparm_query"]
+        assert "sys_updated_on>" not in query
+
+    async def test_fetches_memberships(self, servicenow_connector):
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
             mock_datasource = AsyncMock()
             mock_datasource.get_now_table_tableName = AsyncMock(
@@ -698,13 +715,8 @@ class TestFetchAllMemberships:
             result = await servicenow_connector._fetch_all_memberships()
             assert len(result) == 1
 
-    async def test_delta_sync(self, servicenow_connector):
-        servicenow_connector.group_sync_point = AsyncMock()
-        servicenow_connector.group_sync_point.read_sync_point = AsyncMock(
-            return_value={"last_sync_time": "2024-01-01"}
-        )
-        servicenow_connector.group_sync_point.update_sync_point = AsyncMock()
-
+    async def test_reads_every_row(self, servicenow_connector):
+        """A delta read plus a replace write removes members that nobody removed."""
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
             mock_datasource = AsyncMock()
             mock_datasource.get_now_table_tableName = AsyncMock(
@@ -713,6 +725,8 @@ class TestFetchAllMemberships:
             mock_ds.return_value = mock_datasource
             result = await servicenow_connector._fetch_all_memberships()
             assert result == []
+            call_kwargs = mock_datasource.get_now_table_tableName.call_args.kwargs
+            assert "sys_updated_on>" not in call_kwargs["sysparm_query"]
 
 
 # ===========================================================================
@@ -797,10 +811,6 @@ class TestFetchRoles:
             assert len(result) == 1
 
     async def test_fetches_role_assignments(self, servicenow_connector):
-        servicenow_connector.role_assignment_sync_point = AsyncMock()
-        servicenow_connector.role_assignment_sync_point.read_sync_point = AsyncMock(return_value=None)
-        servicenow_connector.role_assignment_sync_point.update_sync_point = AsyncMock()
-
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock) as mock_ds:
             mock_datasource = AsyncMock()
             mock_datasource.get_now_table_tableName = AsyncMock(
@@ -845,28 +855,22 @@ class TestFetchRoles:
             await servicenow_connector._fetch_all_roles()
 
     @pytest.mark.asyncio
-    async def test_fetch_all_role_assignments_delta_sync(self, servicenow_connector):
-        servicenow_connector.role_assignment_sync_point = AsyncMock()
-        servicenow_connector.role_assignment_sync_point.read_sync_point = AsyncMock(
-            return_value={"last_sync_time": "2024-01-01 00:00:00"}
-        )
-        servicenow_connector.role_assignment_sync_point.update_sync_point = AsyncMock()
-
+    async def test_fetch_all_role_assignments_reads_every_row(self, servicenow_connector):
+        """A delta read plus a replace write removes roles that nobody revoked."""
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(return_value=_table_api_response([]))
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
         await servicenow_connector._fetch_all_role_assignments()
         call_kwargs = mock_ds.get_now_table_tableName.call_args.kwargs
-        assert "2024-01-01" in call_kwargs["sysparm_query"]
+        assert "sys_updated_on>" not in call_kwargs["sysparm_query"]
 
     @pytest.mark.asyncio
     async def test_fetch_all_role_assignments_outer_exception(self, servicenow_connector):
-        servicenow_connector.role_assignment_sync_point = AsyncMock()
-        servicenow_connector.role_assignment_sync_point.read_sync_point = AsyncMock(
-            side_effect=RuntimeError("sync point fail")
+        servicenow_connector._get_fresh_datasource = AsyncMock(
+            side_effect=RuntimeError("datasource fail")
         )
-        with pytest.raises(RuntimeError, match="sync point fail"):
+        with pytest.raises(RuntimeError, match="datasource fail"):
             await servicenow_connector._fetch_all_role_assignments()
 
     @pytest.mark.asyncio
@@ -1552,10 +1556,6 @@ class TestFetchAllGroupsDeep:
 
 class TestFetchAllMembershipsDeep:
     async def test_paginates_memberships(self, servicenow_connector):
-        servicenow_connector.group_sync_point = AsyncMock()
-        servicenow_connector.group_sync_point.read_sync_point = AsyncMock(return_value=None)
-        servicenow_connector.group_sync_point.update_sync_point = AsyncMock()
-
         page1 = [{"sys_id": f"m{i}", "user": f"u{i}", "group": "g1", "sys_updated_on": "2024-01-01"} for i in range(100)]
         page2 = [{"sys_id": "m100", "user": "u100", "group": "g1", "sys_updated_on": "2024-01-02"}]
 
@@ -1570,8 +1570,6 @@ class TestFetchAllMembershipsDeep:
             assert len(result) == 101
 
     async def test_handles_exception(self, servicenow_connector):
-        servicenow_connector.group_sync_point = AsyncMock()
-        servicenow_connector.group_sync_point.read_sync_point = AsyncMock(return_value=None)
         with patch.object(servicenow_connector, "_get_fresh_datasource", new_callable=AsyncMock,
                           side_effect=Exception("API down")):
             with pytest.raises(Exception, match="API down"):
@@ -1584,9 +1582,6 @@ class TestFetchAllMembershipsDeep:
 
     @pytest.mark.asyncio
     async def test_fetch_all_memberships_api_error_breaks(self, servicenow_connector):
-        servicenow_connector.group_sync_point = AsyncMock()
-        servicenow_connector.group_sync_point.read_sync_point = AsyncMock(return_value=None)
-
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
@@ -2192,10 +2187,6 @@ class TestFlattenAndRoles:
 
     @pytest.mark.asyncio
     async def test_fetch_all_role_assignments_pagination(self, servicenow_connector):
-        servicenow_connector.role_assignment_sync_point = AsyncMock()
-        servicenow_connector.role_assignment_sync_point.read_sync_point = AsyncMock(return_value=None)
-        servicenow_connector.role_assignment_sync_point.update_sync_point = AsyncMock()
-
         page1 = [
             {"sys_id": f"ra{i}", "user": f"u{i}", "role": "r1", "sys_updated_on": "2024-01-01"}
             for i in range(100)
@@ -2214,9 +2205,6 @@ class TestFlattenAndRoles:
 
     @pytest.mark.asyncio
     async def test_fetch_all_role_assignments_api_error(self, servicenow_connector):
-        servicenow_connector.role_assignment_sync_point = AsyncMock()
-        servicenow_connector.role_assignment_sync_point.read_sync_point = AsyncMock(return_value=None)
-
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(
             side_effect=ServiceNowAPIError(500, "fail", None)
