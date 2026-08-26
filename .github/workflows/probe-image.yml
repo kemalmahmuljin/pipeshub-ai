@@ -36,6 +36,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          # A bare commit sha is not a branch, so the default shallow fetch
+          # cannot find it. Full history keeps the provenance exact.
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 
