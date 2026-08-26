@@ -239,6 +239,9 @@ class ServiceNowConnector(BaseConnector):
 
         # Configuration
         self.instance_url: Optional[str] = None
+        # The portal that serves the knowledge pages. Read from the instance
+        # during init(), because it differs from one instance to the next.
+        self.kb_portal_suffix: str = ServiceNowDefaults.KB_PORTAL_SUFFIX
         self.client_id: Optional[str] = None
         self.client_secret: Optional[str] = None
         self.redirect_uri: Optional[str] = None
@@ -316,7 +319,8 @@ class ServiceNowConnector(BaseConnector):
 
             oauth_config_data = oauth_config.get(OAuthConfigKeys.CONFIG, {})
 
-            self.instance_url = oauth_config_data.get(AuthFieldKeys.INSTANCE_URL)
+            # A trailing slash would give "https://<instance>.service-now.com//kb?...".
+            self.instance_url = (oauth_config_data.get(AuthFieldKeys.INSTANCE_URL) or "").rstrip("/") or None
             self.client_id = oauth_config_data.get(AuthFieldKeys.CLIENT_ID)
             self.client_secret = oauth_config_data.get(AuthFieldKeys.CLIENT_SECRET)
             self.redirect_uri = oauth_config.get(AuthFieldKeys.REDIRECT_URI)
@@ -369,6 +373,8 @@ class ServiceNowConnector(BaseConnector):
             if not await self.test_connection_and_access():
                 self.logger.error("❌ Connection test failed")
                 return False
+
+            self.kb_portal_suffix = await self._resolve_kb_portal_suffix()
 
             self.logger.info("✅ ServiceNow KB Connector initialized successfully")
             return True
@@ -565,6 +571,57 @@ class ServiceNowConnector(BaseConnector):
             raise HTTPException(
                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stream record: {str(e)}"
             )
+
+    async def _resolve_kb_portal_suffix(self) -> str:
+        """Find the Service Portal that serves the knowledge pages.
+
+        The article pages (kb_article_view, kb_category, kb_home) belong to a
+        portal, and each instance chooses its own. The Knowledge Management
+        portal plugin records that choice in a system property. When the
+        property is empty the default portal serves the pages. Both reads are
+        best effort: a wrong link is better than a failed sync.
+
+        Returns:
+            str: The portal URL suffix, for example "kb" or "esc".
+        """
+        try:
+            datasource = await self._get_fresh_datasource()
+
+            response = await datasource.get_now_table_tableName(
+                tableName=ServiceNowTables.SYS_PROPERTIES,
+                sysparm_query=f"{ServiceNowFields.NAME}={ServiceNowDefaults.KB_PORTAL_PROPERTY}",
+                sysparm_fields=ServiceNowFields.VALUE,
+                sysparm_limit=ServiceNowDefaults.DEFAULT_LIMIT,
+                sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+            )
+            suffix = (response.result[0].get(ServiceNowFields.VALUE) or "").strip() if response.result else ""
+            if suffix:
+                self.logger.info(f"Knowledge portal from the instance property: /{suffix}")
+                return suffix
+
+            response = await datasource.get_now_table_tableName(
+                tableName=ServiceNowTables.SP_PORTAL,
+                sysparm_query=f"{ServiceNowFields.DEFAULT}=true",
+                sysparm_fields=ServiceNowFields.URL_SUFFIX,
+                sysparm_limit=ServiceNowDefaults.DEFAULT_LIMIT,
+                sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+            )
+            suffix = (response.result[0].get(ServiceNowFields.URL_SUFFIX) or "").strip() if response.result else ""
+            if suffix:
+                self.logger.info(f"Knowledge portal from the default portal: /{suffix}")
+                return suffix
+
+        except Exception as e:
+            self.logger.warning(f"Could not read the knowledge portal from the instance: {e}")
+
+        self.logger.info(
+            f"Knowledge portal falls back to /{ServiceNowDefaults.KB_PORTAL_SUFFIX}"
+        )
+        return ServiceNowDefaults.KB_PORTAL_SUFFIX
 
     async def _fetch_article_content(self, article_sys_id: str) -> str:
         """
@@ -2680,7 +2737,11 @@ class ServiceNowConnector(BaseConnector):
             # Construct web URL
             web_url = None
             if self.instance_url:
-                web_url = ServiceNowURLPatterns.KB_BASE.format(instance_url=self.instance_url, sys_id=sys_id)
+                web_url = ServiceNowURLPatterns.KB_BASE.format(
+                    instance_url=self.instance_url,
+                    portal=self.kb_portal_suffix,
+                    sys_id=sys_id,
+                )
 
             # Create RecordGroup for Knowledge Base
             kb_record_group = RecordGroup(
@@ -2734,7 +2795,11 @@ class ServiceNowConnector(BaseConnector):
             # Construct web URL
             web_url = None
             if self.instance_url:
-                web_url = ServiceNowURLPatterns.KB_CATEGORY.format(instance_url=self.instance_url, sys_id=sys_id)
+                web_url = ServiceNowURLPatterns.KB_CATEGORY.format(
+                    instance_url=self.instance_url,
+                    portal=self.kb_portal_suffix,
+                    sys_id=sys_id,
+                )
 
             # Create RecordGroup for Category
             category_record_group = RecordGroup(
@@ -2789,7 +2854,11 @@ class ServiceNowConnector(BaseConnector):
             # Construct web URL
             web_url = None
             if self.instance_url:
-                web_url = ServiceNowURLPatterns.KB_ARTICLE.format(instance_url=self.instance_url, sys_id=sys_id)
+                web_url = ServiceNowURLPatterns.KB_ARTICLE.format(
+                    instance_url=self.instance_url,
+                    portal=self.kb_portal_suffix,
+                    sys_id=sys_id,
+                )
 
             # Extract category sys_id for external_record_group_id
             # Fallback to KB if category is empty/missing

@@ -2760,3 +2760,53 @@ class TestSyncArticles:
         )
         with pytest.raises(RuntimeError, match="article sync fail"):
             await servicenow_connector._sync_articles()
+
+
+# ===========================================================================
+# _resolve_kb_portal_suffix and the article web URL
+# ===========================================================================
+
+class TestResolveKbPortalSuffix:
+    @pytest.mark.asyncio
+    async def test_uses_the_instance_property(self, servicenow_connector):
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(
+            return_value=_table_api_response([{"value": "kb"}])
+        )
+        servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        assert await servicenow_connector._resolve_kb_portal_suffix() == "kb"
+        assert mock_ds.get_now_table_tableName.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_default_portal(self, servicenow_connector):
+        """An empty property means the default portal serves the knowledge pages."""
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=[
+            _table_api_response([{"value": ""}]),
+            _table_api_response([{"url_suffix": "esc"}]),
+        ])
+        servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        assert await servicenow_connector._resolve_kb_portal_suffix() == "esc"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_knowledge_portal_on_error(self, servicenow_connector):
+        """A wrong link is better than a failed sync."""
+        servicenow_connector._get_fresh_datasource = AsyncMock(side_effect=RuntimeError("no access"))
+
+        assert await servicenow_connector._resolve_kb_portal_suffix() == "kb"
+
+
+class TestArticleWebUrl:
+    def test_article_url_uses_the_resolved_portal(self, servicenow_connector):
+        servicenow_connector.instance_url = "https://dev194883.service-now.com"
+        servicenow_connector.kb_portal_suffix = "esc"
+
+        record = servicenow_connector._transform_to_article_webpage_record(
+            KBKnowledge(sys_id="art1", short_description="Title", kb_category="cat1")
+        )
+
+        assert record.weburl == (
+            "https://dev194883.service-now.com/esc?id=kb_article_view&sys_kb_id=art1"
+        )
