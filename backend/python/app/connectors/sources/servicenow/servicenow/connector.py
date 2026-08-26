@@ -423,9 +423,8 @@ class ServiceNowConnector(BaseConnector):
         if not fresh_token:
             raise Exception("No access token available")
 
-        # Update client's token if it changed (mutation)
         if self.servicenow_client.access_token != fresh_token:
-            self.servicenow_client.access_token = fresh_token
+            self.servicenow_client.set_access_token(fresh_token)
 
         return ServiceNowDataSource(self.servicenow_client)
 
