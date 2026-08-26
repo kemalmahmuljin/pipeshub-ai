@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from app.config.constants.arangodb import Connectors, MimeTypes
 from app.connectors.sources.servicenow.servicenow.constants import ORGANIZATIONAL_ENTITIES
 from app.connectors.sources.servicenow.servicenow.connector import ServiceNowConnector
-from app.models.entities import AppUser, AppUserGroup, FileRecord, RecordType, WebpageRecord
+from app.models.entities import AppUser, AppUserGroup, FileRecord, RecordGroupType, RecordType, WebpageRecord
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.external.servicenow.models import (
     ServiceNowAPIError,
@@ -2810,3 +2810,63 @@ class TestArticleWebUrl:
         assert record.weburl == (
             "https://dev194883.service-now.com/esc?id=kb_article_view&sys_kb_id=art1"
         )
+
+
+# ===========================================================================
+# glide.knowman.apply_article_read_criteria
+# ===========================================================================
+
+class TestArticleReadCriteriaOverride:
+    """ServiceNow applies article Can Read criteria as an override only when
+    glide.knowman.apply_article_read_criteria is true. Confirmed on a developer
+    instance: with the property false, a knowledge base grant opens an article
+    whose own criteria name a different group."""
+
+    def _article(self):
+        return KBKnowledge(
+            sys_id="art1",
+            short_description="Restricted",
+            kb_category="cat1",
+            can_read_user_criteria="crit1",
+        )
+
+    def test_article_inherits_the_base_grant_by_default(self, servicenow_connector):
+        servicenow_connector.apply_article_read_criteria = False
+
+        record = servicenow_connector._transform_to_article_webpage_record(self._article())
+
+        assert record.inherit_permissions is True
+
+    def test_own_criteria_stop_the_inheritance_when_the_property_is_on(self, servicenow_connector):
+        servicenow_connector.apply_article_read_criteria = True
+
+        record = servicenow_connector._transform_to_article_webpage_record(self._article())
+
+        assert record.inherit_permissions is False
+
+    def test_an_article_without_criteria_always_inherits(self, servicenow_connector):
+        servicenow_connector.apply_article_read_criteria = True
+        article = self._article()
+        article.can_read_user_criteria = ""
+
+        record = servicenow_connector._transform_to_article_webpage_record(article)
+
+        assert record.inherit_permissions is True
+
+    def test_the_attachment_follows_its_article(self, servicenow_connector):
+        record = servicenow_connector._transform_to_attachment_file_record(
+            AttachmentMetadata(
+                sys_id="att1",
+                file_name="doc.pdf",
+                content_type="application/pdf",
+                size_bytes="1024",
+                table_sys_id="art1",
+                sys_created_on="2026-08-01 10:00:00",
+                sys_updated_on="2026-08-01 10:00:00",
+            ),
+            parent_record_group_type=RecordGroupType.SERVICENOW_CATEGORY,
+            parent_external_record_group_id="cat1",
+            inherit_permissions=False,
+        )
+
+        assert record.inherit_permissions is False
