@@ -2432,6 +2432,28 @@ class TestProcessRecordUpdatesBatch:
         await servicenow_connector._process_record_updates_batch([update])
         mock_data_entities_processor.on_new_records.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_process_record_updates_batch_reports_dropped_records(self, servicenow_connector, mock_data_entities_processor):
+        """A dropped record is never written, so the caller must be able to count it."""
+        granted = _record_update(
+            record=MagicMock(spec=WebpageRecord),
+            new_permissions=[Permission(email="u@test.com", type=PermissionType.READ, entity_type=EntityType.USER)],
+            external_record_id="art1",
+        )
+        dropped = _record_update(
+            record=MagicMock(spec=WebpageRecord),
+            new_permissions=[],
+            external_record_id="art2",
+        )
+        servicenow_connector.logger = MagicMock()
+
+        dropped_count = await servicenow_connector._process_record_updates_batch([granted, dropped])
+
+        assert dropped_count == 1
+        written = mock_data_entities_processor.on_new_records.call_args.args[0]
+        assert len(written) == 1
+        assert servicenow_connector.logger.warning.call_args.args[2] == ["art2"]
+
 
 # ===========================================================================
 # create_connector and cleanup
