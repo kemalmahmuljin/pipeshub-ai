@@ -242,6 +242,9 @@ class ServiceNowConnector(BaseConnector):
         # The portal that serves the knowledge pages. Read from the instance
         # during init(), because it differs from one instance to the next.
         self.kb_portal_suffix: str = ServiceNowDefaults.KB_PORTAL_SUFFIX
+        # Whether article criteria override the criteria of the knowledge base.
+        # Read from the instance during init(); false is the ServiceNow default.
+        self.apply_article_read_criteria: bool = False
         self.client_id: Optional[str] = None
         self.client_secret: Optional[str] = None
         self.redirect_uri: Optional[str] = None
@@ -375,6 +378,14 @@ class ServiceNowConnector(BaseConnector):
                 return False
 
             self.kb_portal_suffix = await self._resolve_kb_portal_suffix()
+
+            article_criteria = await self._read_instance_property(
+                ServiceNowDefaults.ARTICLE_READ_CRITERIA_PROPERTY
+            )
+            self.apply_article_read_criteria = (article_criteria or "").strip().lower() == "true"
+            self.logger.info(
+                f"Article read criteria override the knowledge base: {self.apply_article_read_criteria}"
+            )
 
             self.logger.info("✅ ServiceNow KB Connector initialized successfully")
             return True
@@ -572,35 +583,47 @@ class ServiceNowConnector(BaseConnector):
                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stream record: {str(e)}"
             )
 
-    async def _resolve_kb_portal_suffix(self) -> str:
-        """Find the Service Portal that serves the knowledge pages.
+    async def _read_instance_property(self, name: str) -> Optional[str]:
+        """Read one sys_properties value, or None when it cannot be read.
 
-        The article pages (kb_article_view, kb_category, kb_home) belong to a
-        portal, and each instance chooses its own. The Knowledge Management
-        portal plugin records that choice in a system property. When the
-        property is empty the default portal serves the pages. Both reads are
-        best effort: a wrong link is better than a failed sync.
-
-        Returns:
-            str: The portal URL suffix, for example "kb" or "esc".
+        Every caller has a working default, so a missing property or a token
+        without rights on sys_properties must not fail the sync.
         """
         try:
             datasource = await self._get_fresh_datasource()
-
             response = await datasource.get_now_table_tableName(
                 tableName=ServiceNowTables.SYS_PROPERTIES,
-                sysparm_query=f"{ServiceNowFields.NAME}={ServiceNowDefaults.KB_PORTAL_PROPERTY}",
+                sysparm_query=f"{ServiceNowFields.NAME}={name}",
                 sysparm_fields=ServiceNowFields.VALUE,
                 sysparm_limit=ServiceNowDefaults.DEFAULT_LIMIT,
                 sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
                 sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
                 sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
             )
-            suffix = (response.result[0].get(ServiceNowFields.VALUE) or "").strip() if response.result else ""
-            if suffix:
-                self.logger.info(f"Knowledge portal from the instance property: /{suffix}")
-                return suffix
+            if response.result:
+                return (response.result[0].get(ServiceNowFields.VALUE) or "").strip()
+        except Exception as e:
+            self.logger.warning(f"Could not read the instance property {name}: {e}")
+        return None
 
+    async def _resolve_kb_portal_suffix(self) -> str:
+        """Find the Service Portal that serves the knowledge pages.
+
+        The article pages (kb_article_view, kb_category, kb_home) belong to a
+        portal, and each instance chooses its own. The Knowledge Management
+        portal plugin records that choice in a system property. When the
+        property is empty the default portal serves the pages.
+
+        Returns:
+            str: The portal URL suffix, for example "kb" or "esc".
+        """
+        suffix = await self._read_instance_property(ServiceNowDefaults.KB_PORTAL_PROPERTY)
+        if suffix:
+            self.logger.info(f"Knowledge portal from the instance property: /{suffix}")
+            return suffix
+
+        try:
+            datasource = await self._get_fresh_datasource()
             response = await datasource.get_now_table_tableName(
                 tableName=ServiceNowTables.SP_PORTAL,
                 sysparm_query=f"{ServiceNowFields.DEFAULT}=true",
@@ -614,9 +637,8 @@ class ServiceNowConnector(BaseConnector):
             if suffix:
                 self.logger.info(f"Knowledge portal from the default portal: /{suffix}")
                 return suffix
-
         except Exception as e:
-            self.logger.warning(f"Could not read the knowledge portal from the instance: {e}")
+            self.logger.warning(f"Could not read the default portal: {e}")
 
         self.logger.info(
             f"Knowledge portal falls back to /{ServiceNowDefaults.KB_PORTAL_SUFFIX}"
@@ -2189,6 +2211,7 @@ class ServiceNowConnector(BaseConnector):
                     att_data,
                     parent_record_group_type=article_record.record_group_type,
                     parent_external_record_group_id=article_record.external_record_group_id,
+                    inherit_permissions=article_record.inherit_permissions,
                 )
 
                 if att_record:
@@ -2899,10 +2922,17 @@ class ServiceNowConnector(BaseConnector):
                     self.logger.warning(f"Article {sys_id} has no category and no KB - skipping")
                     return None
 
+            # An article that carries its own Can Read criteria must not also
+            # receive the grants of its knowledge base, but only on an instance
+            # where that override is switched on. See KBKnowledgeSNC.canRead.
+            own_read_criteria = bool((article_data.can_read_user_criteria or "").strip())
+            inherit_permissions = not (self.apply_article_read_criteria and own_read_criteria)
+
             # Create WebpageRecord for Article
             record_id = str(uuid.uuid4())
             article_record = WebpageRecord(
                 id=record_id,
+                inherit_permissions=inherit_permissions,
                 external_record_id=sys_id,
                 version=0,
                 record_name=short_description,
@@ -2929,6 +2959,7 @@ class ServiceNowConnector(BaseConnector):
         attachment_data: AttachmentMetadata,
         parent_record_group_type: Optional[RecordGroupType] = None,
         parent_external_record_group_id: Optional[str] = None,
+        inherit_permissions: bool = True,
     ) -> Optional[FileRecord]:
         """
         Transform ServiceNow sys_attachment to FileRecord entity.
@@ -2937,6 +2968,8 @@ class ServiceNowConnector(BaseConnector):
             attachment_data: ServiceNow sys_attachment AttachmentMetadata model
             parent_record_group_type: The record group type from parent article (CATEGORY or KB)
             parent_external_record_group_id: The external record group ID from parent article
+            inherit_permissions: Follows the parent article, so an attachment never
+                reaches a reader that the article itself keeps out
 
         Returns:
             FileRecord: Transformed attachment or None if invalid
@@ -2984,6 +3017,7 @@ class ServiceNowConnector(BaseConnector):
             attachment_record_id = str(uuid.uuid4())
             attachment_record = FileRecord(
                 id=attachment_record_id,
+                inherit_permissions=inherit_permissions,
                 org_id=self.data_entities_processor.org_id,
                 record_name=file_name,
                 record_type=RecordType.FILE,
