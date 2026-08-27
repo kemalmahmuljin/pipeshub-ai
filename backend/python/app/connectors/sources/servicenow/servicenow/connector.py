@@ -2139,6 +2139,36 @@ class ServiceNowConnector(BaseConnector):
             self.logger.error(f"❌ Error syncing articles: {e}", exc_info=True)
             raise
 
+    async def _remove_detached_attachments(
+        self, article_sys_id: str, attachments_data: List[AttachmentMetadata]
+    ) -> int:
+        """Delete the records of attachments the article no longer carries.
+
+        An attachment removed from an article that stays published leaves no
+        trace anywhere the other passes look: the article row is untouched
+        except for its timestamp, and sys_attachment simply stops returning the
+        row. Only the difference between what the article carries now and what
+        is stored says it went.
+
+        Returns the number of records deleted.
+        """
+        current = {a.sys_id for a in attachments_data if a.sys_id}
+        stored = await self.data_entities_processor.get_records_by_parent(
+            self.connector_id, article_sys_id
+        )
+        detached = [r for r in stored if r.external_record_id not in current]
+        if not detached:
+            return 0
+
+        result = await self.data_entities_processor.on_records_deleted_cascade(
+            [r.id for r in detached], self.connector_id
+        )
+        deleted = len((result or {}).get("deleted_records") or [])
+        self.logger.info(
+            f"🗑️ Removed {deleted} detached attachment record(s) from article {article_sys_id}"
+        )
+        return deleted
+
     async def _remove_deleted_articles(self) -> int:
         """Delete the records of articles that were removed from kb_knowledge.
 
@@ -2367,6 +2397,7 @@ class ServiceNowConnector(BaseConnector):
 
             # Fetch attachments for this article
             attachments_data = await self._fetch_attachments_for_article(article_sys_id)
+            await self._remove_detached_attachments(article_sys_id, attachments_data)
 
             # Extract criteria IDs from article's can_read_user_criteria field
             can_read_criteria = article_data.can_read_user_criteria or ""

@@ -3050,6 +3050,70 @@ class TestSyncArticlesRemovesUnpublished:
         assert "text" not in removal[0]["sysparm_fields"].split(",")
 
 
+class TestDetachedAttachmentRemoval:
+    """An attachment removed from an article that stays published leaves no
+    trace anywhere the other passes look: the article row is untouched except
+    for its timestamp, and sys_attachment simply stops returning the row."""
+
+    def _attachment(self, sys_id):
+        return AttachmentMetadata(
+            sys_id=sys_id, file_name=f"{sys_id}.pdf", content_type="application/pdf",
+            size_bytes="10", table_sys_id="art1",
+            sys_created_on="2026-08-01 10:00:00", sys_updated_on="2026-08-01 10:00:00",
+        )
+
+    def _stored(self, external_id, rec_id):
+        r = MagicMock()
+        r.id = rec_id
+        r.external_record_id = external_id
+        return r
+
+    @pytest.mark.asyncio
+    async def test_an_attachment_that_went_loses_its_record(self, servicenow_connector,
+                                                            mock_data_entities_processor):
+        mock_data_entities_processor.get_records_by_parent = AsyncMock(return_value=[
+            self._stored("att1", "rec-att1"),
+            self._stored("att2", "rec-att2"),
+        ])
+        mock_data_entities_processor.on_records_deleted_cascade = AsyncMock(
+            return_value={"deleted_records": ["rec-att2"]}
+        )
+
+        deleted = await servicenow_connector._remove_detached_attachments(
+            "art1", [self._attachment("att1")]
+        )
+
+        assert deleted == 1
+        mock_data_entities_processor.on_records_deleted_cascade.assert_awaited_once_with(
+            ["rec-att2"], servicenow_connector.connector_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_attachment_still_there_keeps_its_record(self, servicenow_connector,
+                                                             mock_data_entities_processor):
+        mock_data_entities_processor.get_records_by_parent = AsyncMock(return_value=[
+            self._stored("att1", "rec-att1"),
+        ])
+
+        deleted = await servicenow_connector._remove_detached_attachments(
+            "art1", [self._attachment("att1")]
+        )
+
+        assert deleted == 0
+        mock_data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_article_with_no_stored_children_deletes_nothing(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        mock_data_entities_processor.get_records_by_parent = AsyncMock(return_value=[])
+
+        deleted = await servicenow_connector._remove_detached_attachments("art1", [])
+
+        assert deleted == 0
+        mock_data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+
 class TestDeletedArticleRemoval:
     """A deleted article leaves no row in kb_knowledge, so the unpublished pass
     cannot see it. ServiceNow records the deletion in sys_audit_delete, keyed by
