@@ -1481,7 +1481,6 @@ class TestSyncCategories:
         mock_ds.get_now_table_tableName = AsyncMock(side_effect=[
             _table_api_response(page1),
             _table_api_response(page2),
-            _table_api_response([]),   # the removal pass, which reads its own projection
         ])
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
@@ -2668,7 +2667,8 @@ class TestSyncArticles:
         mock_ds.get_now_table_tableName = AsyncMock(side_effect=[
             _table_api_response(page1),
             _table_api_response(page2),
-            _table_api_response([]),   # the removal pass, which reads its own projection
+            _table_api_response([]),   # the unpublished pass, with its own projection
+            _table_api_response([]),   # the sys_audit_delete pass
         ])
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
@@ -2676,8 +2676,8 @@ class TestSyncArticles:
                           return_value=[_record_update()]):
             await servicenow_connector._sync_articles()
 
-        # Two indexing pages, then the removal pass with its own projection.
-        assert mock_ds.get_now_table_tableName.call_count == 3
+        # Two indexing pages, then the two removal passes.
+        assert mock_ds.get_now_table_tableName.call_count == 4
         servicenow_connector.article_sync_point.update_sync_point.assert_called_once()
 
     @pytest.mark.asyncio
@@ -3125,6 +3125,111 @@ class TestSyncArticlesRemovesUnpublished:
         # Versioning makes retired rows outnumber published ones, so pulling
         # their bodies would dominate the sync.
         assert "text" not in removal[0]["sysparm_fields"].split(",")
+
+
+class TestDeletedArticleRemoval:
+    """A deleted article leaves no row in kb_knowledge, so the unpublished pass
+    cannot see it. ServiceNow records the deletion in sys_audit_delete, keyed by
+    sys_id in documentkey — the only trace an integration can read.
+
+    Confirmed on a developer instance: an article deleted through the Table API
+    appeared there within the second, and its record survived every sync."""
+
+    def _sync_point(self, connector, stored=None):
+        connector.article_sync_point = AsyncMock()
+        connector.article_sync_point.read_sync_point = AsyncMock(return_value=stored)
+        connector.article_sync_point.update_sync_point = AsyncMock()
+        return connector.article_sync_point
+
+    async def _run(self, connector, audit_rows, *, error=None, stored=None):
+        self._sync_point(connector, stored)
+
+        async def _respond(**kwargs):
+            if kwargs.get("tableName") != "sys_audit_delete":
+                return _table_api_response([])
+            if error is not None:
+                raise error
+            return _table_api_response(audit_rows)
+
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._captured_ds = mock_ds
+        return await connector._remove_deleted_articles()
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_article_loses_its_record(self, servicenow_connector,
+                                                     mock_data_entities_processor):
+        record = MagicMock()
+        record.id = "rec-1"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+        mock_data_entities_processor.on_records_deleted_cascade = AsyncMock(
+            return_value={"deleted_records": ["rec-1"]}
+        )
+
+        removed = await self._run(servicenow_connector, [
+            {"documentkey": "art1", "sys_created_on": "2026-08-27 09:18:06"},
+        ])
+
+        assert removed == 1
+        mock_data_entities_processor.on_records_deleted_cascade.assert_awaited_once_with(
+            ["rec-1"], servicenow_connector.connector_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_knowledge_deletions_are_read(self, servicenow_connector):
+        await self._run(servicenow_connector, [])
+        q = servicenow_connector._captured_ds.get_now_table_tableName.call_args.kwargs["sysparm_query"]
+        # The table records deletions for every table on the instance, so the
+        # filter has to be server-side.
+        assert "tablename=kb_knowledge" in q
+
+    @pytest.mark.asyncio
+    async def test_it_reads_its_own_sync_point_not_the_articles_one(self, servicenow_connector):
+        """The articles watermark is the newest sys_updated_on of a published
+        article. Reusing it skips every deletion older than that timestamp, and
+        skips it for good, because a watermark only moves forward."""
+        await self._run(servicenow_connector, [],
+                        stored={"last_sync_time": "2026-08-27 09:18:00"})
+
+        key = servicenow_connector.article_sync_point.read_sync_point.call_args.args[0]
+        assert key == "deletions"
+        q = servicenow_connector._captured_ds.get_now_table_tableName.call_args.kwargs["sysparm_query"]
+        assert "sys_created_on>2026-08-27 09:18:00" in q
+
+    @pytest.mark.asyncio
+    async def test_a_clean_pass_advances_its_own_watermark(self, servicenow_connector):
+        await self._run(servicenow_connector, [
+            {"documentkey": "art1", "sys_created_on": "2026-08-27 09:18:06"},
+            {"documentkey": "art2", "sys_created_on": "2026-08-27 10:02:11"},
+        ])
+
+        servicenow_connector.article_sync_point.update_sync_point.assert_awaited_once_with(
+            "deletions", {"last_sync_time": "2026-08-27 10:02:11"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_pass_leaves_the_watermark_alone(self, servicenow_connector):
+        """Advancing past a page that was never read would lose those deletions
+        permanently; leaving it puts them in the next pass instead."""
+        await self._run(servicenow_connector, [],
+                        error=ServiceNowAPIError(403, "forbidden", None))
+
+        servicenow_connector.article_sync_point.update_sync_point.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_audit_table_does_not_fail_the_sync(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        """A least-privilege integration user may not read sys_audit_delete.
+        Losing deletion detection beats refusing to sync."""
+        removed = await self._run(
+            servicenow_connector, [],
+            error=ServiceNowAPIError(403, "forbidden", None),
+        )
+
+        assert removed == 0
+        mock_data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
 
 
 class TestArticleReadCriteriaOverride:

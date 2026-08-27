@@ -27,6 +27,7 @@ class ServiceNowTables:
     SYS_USER_HAS_ROLE = "sys_user_has_role"
     SYS_USER_ROLE_CONTAINS = "sys_user_role_contains"
     SYS_ATTACHMENT = "sys_attachment"
+    SYS_AUDIT_DELETE = "sys_audit_delete"
     USER_CRITERIA = "user_criteria"
     SYS_PROPERTIES = "sys_properties"
     SP_PORTAL = "sp_portal"
@@ -50,6 +51,8 @@ class ServiceNowFields:
     ACTIVE = "active"
     PUBLISHED = "published"
     WORKFLOW_STATE = "workflow_state"
+    DOCUMENTKEY = "documentkey"
+    TABLENAME = "tablename"
     PARENT = "parent"
     PARENT_ID = "parent_id"
     LABEL = "label"
@@ -105,6 +108,7 @@ class ServiceNowQueryValues:
     NO_COUNT_TRUE = "true"
     EXCLUDE_REFERENCE_LINK_TRUE = "true"
     ORDER_BY_UPDATED = "ORDERBYsys_updated_on"
+    ORDER_BY_CREATED = "ORDERBYsys_created_on"
 
 
 class ServiceNowURLPatterns:
@@ -162,6 +166,7 @@ class ServiceNowSyncPointKeys:
     USERS = "users"
     CATEGORIES = "categories"
     ARTICLES = "articles"
+    DELETIONS = "deletions"
     LAST_SYNC_TIME = "last_sync_time"
 
 
