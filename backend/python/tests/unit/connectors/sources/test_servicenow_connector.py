@@ -1184,11 +1184,14 @@ class TestSyncSingleOrganizationalEntity:
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        with patch.object(servicenow_connector.logger, "error") as mock_error:
+        with patch.object(servicenow_connector.logger, "error") as mock_error, \
+             pytest.raises(ServiceNowAPIError):
             await servicenow_connector._sync_single_organizational_entity(
                 "company", ORGANIZATIONAL_ENTITIES["company"]
             )
-            mock_error.assert_called()
+        mock_error.assert_called()
+        # A page that failed must not leave a checkpoint claiming it was read.
+        sync_point.update_sync_point.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sync_point_read_exception_propagates(self, servicenow_connector):
@@ -1488,7 +1491,9 @@ class TestSyncCategories:
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        await servicenow_connector._sync_categories()
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._sync_categories()
+        servicenow_connector.category_sync_point.update_sync_point.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sync_categories_skips_invalid_transform(self, servicenow_connector, mock_data_entities_processor):
@@ -1693,8 +1698,11 @@ class TestSyncUsersErrors:
                 side_effect=ServiceNowAPIError(401, "Unauthorized", None)
             )
             mock_ds.return_value = mock_datasource
-            await servicenow_connector._sync_users()
+            with pytest.raises(ServiceNowAPIError):
+                await servicenow_connector._sync_users()
             servicenow_connector.data_entities_processor.on_new_app_users.assert_not_called()
+            # A page that failed must not leave a checkpoint claiming it was read.
+            servicenow_connector.user_sync_point.update_sync_point.assert_not_awaited()
 
     async def test_exception_propagated(self, servicenow_connector):
         servicenow_connector.user_sync_point = AsyncMock()
@@ -1727,7 +1735,8 @@ class TestSyncKnowledgeBasesDeep:
                 side_effect=ServiceNowAPIError(500, "Server error", None)
             )
             mock_ds.return_value = mock_datasource
-            await servicenow_connector._sync_knowledge_bases([])
+            with pytest.raises(ServiceNowAPIError):
+                await servicenow_connector._sync_knowledge_bases([])
 
     async def test_exception_in_kb_sync_propagated(self, servicenow_connector):
         servicenow_connector._get_fresh_datasource = AsyncMock(
@@ -2665,9 +2674,11 @@ class TestSyncArticles:
         )
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
-        await servicenow_connector._sync_articles()
+        with pytest.raises(ServiceNowAPIError):
+            await servicenow_connector._sync_articles()
         mock_data_entities_processor = servicenow_connector.data_entities_processor
         mock_data_entities_processor.on_new_records.assert_not_called()
+        servicenow_connector.article_sync_point.update_sync_point.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sync_articles_updates_sync_checkpoint(self, servicenow_connector):

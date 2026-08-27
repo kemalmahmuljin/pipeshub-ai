@@ -916,8 +916,11 @@ class ServiceNowConnector(BaseConnector):
                     )
                     
                 except ServiceNowAPIError as e:
-                    self.logger.error(f"❌ API error: {e.message} (status: {e.status_code})")
-                    break
+                    # A short list is indistinguishable from a complete one to
+                    # everything downstream, so the sync would report success over
+                    # whatever this page did not return.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 # Extract users from response
                 users_data = response.result
@@ -1619,8 +1622,11 @@ class ServiceNowConnector(BaseConnector):
                     )
                     
                 except ServiceNowAPIError as e:
-                    self.logger.error(f"❌ API error: {e.message} (status: {e.status_code})")
-                    break
+                    # A short list is indistinguishable from a complete one to
+                    # everything downstream, so the sync would report success over
+                    # whatever this page did not return.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 # Extract entities from response
                 entities_data = response.result
@@ -1730,9 +1736,15 @@ class ServiceNowConnector(BaseConnector):
                     )
                     
                 except ServiceNowAPIError as e:
-                    if "Expecting value" not in str(e):
-                        self.logger.error(f"❌ API error: {e.message} (status: {e.status_code})")
-                    break
+                    # An empty page comes back as a body that is not JSON, so this
+                    # particular failure is how the read ends, not a fault.
+                    if "Expecting value" in str(e):
+                        break
+                    # A short list is indistinguishable from a complete one to
+                    # everything downstream, so the sync would report success over
+                    # whatever this page did not return.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 # Extract KBs from response
                 kbs_data = response.result
@@ -1871,9 +1883,12 @@ class ServiceNowConnector(BaseConnector):
                         sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
                     )
                     
+                    # A short list is indistinguishable from a complete one to
+                    # everything downstream, so the sync would report success over
+                    # whatever this page did not return.
                 except ServiceNowAPIError as e:
-                    self.logger.error(f"❌ API error: {e.message} (status: {e.status_code}")
-                    break
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 # Extract categories from response
                 categories_data = response.result
@@ -1985,8 +2000,11 @@ class ServiceNowConnector(BaseConnector):
                     )
                     
                 except ServiceNowAPIError as e:
-                    self.logger.error(f"❌ API error: {e.message} (status: {e.status_code})")
-                    break
+                    # A short list is indistinguishable from a complete one to
+                    # everything downstream, so the sync would report success over
+                    # whatever this page did not return.
+                    self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                    raise
 
                 # Extract articles from response
                 articles_data = response.result
