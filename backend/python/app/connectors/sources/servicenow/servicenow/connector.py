@@ -2164,7 +2164,7 @@ class ServiceNowConnector(BaseConnector):
         """
         current = {a.sys_id for a in attachments_data if a.sys_id}
         stored = await self.data_entities_processor.get_records_by_parent(
-            self.connector_id, article_sys_id
+            self.connector_id, article_sys_id, RecordType.FILE.value
         )
         detached = [r for r in stored if r.external_record_id not in current]
         if not detached:
@@ -2243,7 +2243,8 @@ class ServiceNowConnector(BaseConnector):
         remove: Callable[[str], Awaitable[int]],
     ) -> int:
         """Read sys_audit_delete for one table and remove what it reports gone."""
-        last_sync_data = await self.article_sync_point.read_sync_point(sync_key)
+        sync_point = self._deletion_sync_point(table)
+        last_sync_data = await sync_point.read_sync_point(sync_key)
         last_sync_time = (
             last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None
         )
@@ -2253,6 +2254,37 @@ class ServiceNowConnector(BaseConnector):
             query += f"^{ServiceNowFields.SYS_CREATED_ON}>{last_sync_time}"
         query += f"^{ServiceNowQueryValues.ORDER_BY_CREATED}"
 
+        removed, latest_delete_time = await self._read_deletions(table, query, remove)
+
+        if latest_delete_time:
+            await sync_point.update_sync_point(
+                sync_key,
+                {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_delete_time},
+            )
+
+        return removed
+
+    def _deletion_sync_point(self, table: str) -> SyncPoint:
+        """The sync point a table's deletions belong to.
+
+        A knowledge base or a category is a record group, so its watermark has
+        no business sitting under the records data point.
+        """
+        if table == ServiceNowTables.KB_KNOWLEDGE:
+            return self.article_sync_point
+        return self.category_sync_point
+
+    async def _read_deletions(
+        self,
+        table: str,
+        query: str,
+        remove: Callable[[str], Awaitable[int]],
+    ) -> Tuple[int, Optional[str]]:
+        """Page through sys_audit_delete, removing as it goes.
+
+        Returns the count and the newest deletion actually dealt with — never a
+        timestamp beyond a row that failed or a page that was never read.
+        """
         batch_size = ServiceNowDefaults.BATCH_SIZE
         offset = ServiceNowDefaults.PAGINATION_OFFSET
         removed = 0
@@ -2278,13 +2310,11 @@ class ServiceNowConnector(BaseConnector):
                     f"Cannot read {ServiceNowTables.SYS_AUDIT_DELETE}, so {table} deletions keep "
                     f"their records: {e.message} (status: {e.status_code})"
                 )
-                return removed
+                return removed, latest_delete_time
 
             rows = response.result
             if not rows:
                 break
-
-            latest_delete_time = rows[-1].get(ServiceNowFields.SYS_CREATED_ON) or latest_delete_time
 
             for row in rows:
                 sys_id = row.get(ServiceNowFields.DOCUMENTKEY)
@@ -2293,22 +2323,23 @@ class ServiceNowConnector(BaseConnector):
                 try:
                     removed += await remove(sys_id)
                 except Exception as e:
+                    # Stop the watermark here. Moving it past a row that was not
+                    # dealt with drops that deletion for good, because a
+                    # watermark only travels forward.
                     self.logger.error(
                         f"❌ Failed to remove records for deleted {table} row {sys_id}: {e}",
                         exc_info=True,
                     )
+                    return removed, latest_delete_time
+                latest_delete_time = (
+                    row.get(ServiceNowFields.SYS_CREATED_ON) or latest_delete_time
+                )
 
             offset += batch_size
             if len(rows) < batch_size:
                 break
 
-        if latest_delete_time:
-            await self.article_sync_point.update_sync_point(
-                sync_key,
-                {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_delete_time},
-            )
-
-        return removed
+        return removed, latest_delete_time
 
     async def _remove_unpublished_articles(
         self, last_sync_time: Optional[str]
@@ -2367,18 +2398,19 @@ class ServiceNowConnector(BaseConnector):
             if not rows:
                 break
 
-            newest_seen = rows[-1].get(ServiceNowFields.SYS_UPDATED_ON) or newest_seen
-
             for row in rows:
-                if not self._article_left_published_set(row):
-                    continue
-                try:
-                    removed += await self._remove_article_records(row.sys_id)
-                except Exception as e:
-                    self.logger.error(
-                        f"❌ Failed to remove records for article {row.get(ServiceNowFields.SYS_ID)}: {e}",
-                        exc_info=True,
-                    )
+                if self._article_left_published_set(row):
+                    try:
+                        removed += await self._remove_article_records(row.sys_id)
+                    except Exception as e:
+                        # Stop the watermark here, so this row is read again next
+                        # time instead of being stepped over for good.
+                        self.logger.error(
+                            f"❌ Failed to remove records for article {row.get(ServiceNowFields.SYS_ID)}: {e}",
+                            exc_info=True,
+                        )
+                        return removed, newest_seen
+                newest_seen = row.get(ServiceNowFields.SYS_UPDATED_ON) or newest_seen
 
             offset += batch_size
             if len(rows) < batch_size:
