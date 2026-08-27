@@ -2933,6 +2933,10 @@ class ServiceNowConnector(BaseConnector):
                 id=record_id,
                 inherit_permissions=inherit_permissions,
                 external_record_id=sys_id,
+                # The processor rewrites a stored record, and re-queues it for
+                # indexing, only when this differs from what it holds. Leaving it
+                # unset froze every record at its first index.
+                external_revision_id=article_data.sys_updated_on,
                 version=0,
                 record_name=short_description,
                 record_type=RecordType.WEBPAGE,
@@ -3017,6 +3021,7 @@ class ServiceNowConnector(BaseConnector):
             attachment_record = FileRecord(
                 id=attachment_record_id,
                 inherit_permissions=inherit_permissions,
+                external_revision_id=attachment_data.sys_updated_on,
                 org_id=self.data_entities_processor.org_id,
                 record_name=file_name,
                 record_type=RecordType.FILE,

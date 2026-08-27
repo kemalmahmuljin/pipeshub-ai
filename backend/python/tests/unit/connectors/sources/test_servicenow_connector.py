@@ -2834,6 +2834,54 @@ class TestArticleWebUrl:
 # glide.knowman.apply_article_read_criteria
 # ===========================================================================
 
+class TestRecordRevision:
+    """A stored record is rewritten, and re-queued for indexing, only when
+    external_revision_id changes. Leaving it unset froze every record at its
+    first index: title, webUrl and content never updated again."""
+
+    def test_article_carries_a_revision_id(self, servicenow_connector):
+        record = servicenow_connector._transform_to_article_webpage_record(
+            KBKnowledge(
+                sys_id="art1",
+                short_description="Title",
+                kb_category="cat1",
+                sys_updated_on="2026-08-26 09:15:00",
+            )
+        )
+        assert record.external_revision_id == "2026-08-26 09:15:00"
+
+    def test_a_changed_article_gets_a_different_revision_id(self, servicenow_connector):
+        def build(updated_on):
+            return servicenow_connector._transform_to_article_webpage_record(
+                KBKnowledge(
+                    sys_id="art1",
+                    short_description="Title",
+                    kb_category="cat1",
+                    sys_updated_on=updated_on,
+                )
+            )
+
+        before = build("2026-08-26 09:15:00")
+        after = build("2026-08-26 11:42:00")
+        assert before.external_revision_id != after.external_revision_id
+
+    def test_attachment_carries_a_revision_id(self, servicenow_connector):
+        record = servicenow_connector._transform_to_attachment_file_record(
+            AttachmentMetadata(
+                sys_id="att1",
+                file_name="doc.pdf",
+                content_type="application/pdf",
+                size_bytes="1024",
+                table_sys_id="art1",
+                sys_created_on="2026-08-01 10:00:00",
+                sys_updated_on="2026-08-26 11:42:00",
+            ),
+            parent_record_group_type=RecordGroupType.SERVICENOW_CATEGORY,
+            parent_external_record_group_id="cat1",
+        )
+        assert record.external_revision_id == "2026-08-26 11:42:00"
+
+
 class TestArticleReadCriteriaOverride:
     """ServiceNow applies article Can Read criteria as an override only when
     glide.knowman.apply_article_read_criteria is true. Confirmed on a developer
