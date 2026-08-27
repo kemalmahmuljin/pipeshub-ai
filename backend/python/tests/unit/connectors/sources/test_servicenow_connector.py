@@ -142,6 +142,8 @@ def mock_data_entities_processor():
     proc.create_user_group_membership = AsyncMock()
     proc.get_user_by_source_id = AsyncMock(return_value=None)
     proc.get_record_by_external_id = AsyncMock(return_value=None)
+    proc.get_records_by_parent = AsyncMock(return_value=[])
+    proc.on_records_deleted_cascade = AsyncMock(return_value={"deleted_records": []})
     return proc
 
 
@@ -1479,6 +1481,7 @@ class TestSyncCategories:
         mock_ds.get_now_table_tableName = AsyncMock(side_effect=[
             _table_api_response(page1),
             _table_api_response(page2),
+            _table_api_response([]),   # the removal pass, which reads its own projection
         ])
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
@@ -2665,6 +2668,7 @@ class TestSyncArticles:
         mock_ds.get_now_table_tableName = AsyncMock(side_effect=[
             _table_api_response(page1),
             _table_api_response(page2),
+            _table_api_response([]),   # the removal pass, which reads its own projection
         ])
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
@@ -2672,7 +2676,8 @@ class TestSyncArticles:
                           return_value=[_record_update()]):
             await servicenow_connector._sync_articles()
 
-        assert mock_ds.get_now_table_tableName.call_count == 2
+        # Two indexing pages, then the removal pass with its own projection.
+        assert mock_ds.get_now_table_tableName.call_count == 3
         servicenow_connector.article_sync_point.update_sync_point.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2959,6 +2964,167 @@ class TestArticleReadCriteriaResolution:
         servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
         assert await servicenow_connector._resolve_kb_portal_suffix() == "kb"
+class TestUnpublishedArticleRemoval:
+    """An article that leaves the published set must take its record with it.
+
+    ServiceNow offers no change feed, so a deletion never arrives as an event —
+    only as a row saying the article is no longer published. Measured on a
+    developer instance: a retired article stayed browsable and searchable, with
+    its old text, through every following delta sync."""
+
+    def _article(self, **kw):
+        # TableAPIRecord, not KBKnowledge: this is what the sync loop hands over,
+        # and it raises AttributeError for a field the response did not carry.
+        base = dict(sys_id="art1", short_description="Title", kb_category="cat1",
+                    active="true", workflow_state="published")
+        base.update(kw)
+        return TableAPIRecord(**{k: v for k, v in base.items() if v is not None})
+
+    def test_published_article_stays(self, servicenow_connector):
+        assert servicenow_connector._article_left_published_set(self._article()) is False
+
+    @pytest.mark.parametrize("field,value", [
+        ("workflow_state", "outdated"),
+        ("workflow_state", "retired"),
+        ("workflow_state", "draft"),
+        ("active", "false"),
+    ])
+    def test_article_outside_the_published_set(self, servicenow_connector, field, value):
+        assert servicenow_connector._article_left_published_set(self._article(**{field: value})) is True
+
+    @pytest.mark.parametrize("row", [
+        {"workflow_state": None, "active": None},
+        {"workflow_state": "", "active": ""},
+    ])
+    def test_a_missing_field_never_deletes(self, servicenow_connector, row):
+        """Deleting a record cannot be undone by the next sync, so an absent
+        field must not stand in for evidence that the article was retired."""
+        assert servicenow_connector._article_left_published_set(self._article(**row)) is False
+
+    @pytest.mark.asyncio
+    async def test_retired_article_deletes_its_record(self, servicenow_connector,
+                                                      mock_data_entities_processor):
+        record = MagicMock()
+        record.id = "rec-1"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+        mock_data_entities_processor.on_records_deleted_cascade = AsyncMock(
+            return_value={"deleted_records": ["rec-1"]}
+        )
+
+        deleted = await servicenow_connector._remove_article_records("art1")
+
+        assert deleted == 1
+        mock_data_entities_processor.on_records_deleted_cascade.assert_awaited_once_with(
+            ["rec-1"], servicenow_connector.connector_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_cascade_path_takes_the_attachments_too(self, servicenow_connector,
+                                                              mock_data_entities_processor):
+        """The cascade deletes the containment subtree, so attachments need no
+        separate pass — and unlike on_record_deleted it removes the edges and
+        the type document rather than leaving them dangling."""
+        record = MagicMock()
+        record.id = "rec-1"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+        mock_data_entities_processor.on_records_deleted_cascade = AsyncMock(
+            return_value={"deleted_records": ["rec-1", "att-1"]}
+        )
+
+        deleted = await servicenow_connector._remove_article_records("art1")
+
+        assert deleted == 2
+        mock_data_entities_processor.on_record_deleted.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_article_that_was_never_indexed_deletes_nothing(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        deleted = await servicenow_connector._remove_article_records("art1")
+
+        assert deleted == 0
+        mock_data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+
+class TestSyncArticlesRemovesUnpublished:
+    """The behavioural witness: drive _sync_articles over a retired article and
+    require that its record goes. Reproduced live — a retired article stayed
+    browsable and searchable through every following delta sync."""
+
+    def _row(self, **kw):
+        base = dict(sys_id="art1", short_description="Title", kb_category="cat1",
+                    active="true", workflow_state="published",
+                    sys_updated_on="2026-08-27 09:38:57")
+        base.update(kw)
+        return base
+
+    async def _run(self, connector, rows):
+        """Answer the removal pass with `rows` and the indexing pass with nothing.
+
+        The two passes hit the same endpoint and are told apart by their
+        projection: the removal pass reads only the three fields its decision
+        needs, so it never pulls article bodies for retired rows.
+        """
+        calls = []
+
+        async def _respond(**kwargs):
+            calls.append(kwargs)
+            fields = kwargs.get("sysparm_fields", "")
+            is_removal_pass = fields == "sys_id,workflow_state,active"
+            return _table_api_response(rows if is_removal_pass else [])
+
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector.article_sync_point.read_sync_point = AsyncMock(
+            return_value={"last_sync_time": "2026-08-27 09:30:09"}
+        )
+        connector.article_sync_point.update_sync_point = AsyncMock()
+        await connector._sync_articles()
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_retired_article_loses_its_record(self, servicenow_connector,
+                                                    mock_data_entities_processor):
+        record = MagicMock()
+        record.id = "rec-1"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+
+        await self._run(servicenow_connector, [self._row(workflow_state="outdated")])
+
+        mock_data_entities_processor.on_records_deleted_cascade.assert_awaited_once_with(
+            ["rec-1"], servicenow_connector.connector_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_published_article_keeps_its_record(self, servicenow_connector,
+                                                      mock_data_entities_processor):
+        record = MagicMock()
+        record.id = "rec-1"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+
+        await self._run(servicenow_connector, [self._row()])
+
+        mock_data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_removal_pass_reads_rows_the_indexing_query_hides(self, servicenow_connector):
+        calls = await self._run(servicenow_connector, [])
+        removal = [c for c in calls if c.get("sysparm_fields") == "sys_id,workflow_state,active"]
+        assert removal, "the removal pass never ran"
+        # A hidden row cannot trigger a removal, so this query must not filter on state.
+        assert "workflow_state=published" not in removal[0]["sysparm_query"]
+
+    @pytest.mark.asyncio
+    async def test_the_removal_pass_does_not_fetch_article_bodies(self, servicenow_connector):
+        calls = await self._run(servicenow_connector, [])
+        removal = [c for c in calls if "workflow_state=published" not in c["sysparm_query"]]
+        assert removal, "the removal pass never ran"
+        # Versioning makes retired rows outnumber published ones, so pulling
+        # their bodies would dominate the sync.
+        assert "text" not in removal[0]["sysparm_fields"].split(",")
 
 
 class TestArticleReadCriteriaOverride:
