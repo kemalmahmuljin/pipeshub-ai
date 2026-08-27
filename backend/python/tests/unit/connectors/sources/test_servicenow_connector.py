@@ -3129,6 +3129,102 @@ class TestSyncArticlesRemovesUnpublished:
         assert "text" not in removal[0]["sysparm_fields"].split(",")
 
 
+class TestWatermarkStopsAtAFailedRemoval:
+    """A watermark only travels forward, so stepping it past a row whose removal
+    threw would drop that deletion for good. Both passes stop where they broke."""
+
+    async def _audit_run(self, connector, rows, remove):
+        async def _respond(**kwargs):
+            if kwargs.get("tableName") != "sys_audit_delete":
+                return _table_api_response([])
+            return _table_api_response(rows)
+
+        connector.article_sync_point = AsyncMock()
+        connector.article_sync_point.read_sync_point = AsyncMock(return_value=None)
+        connector.article_sync_point.update_sync_point = AsyncMock()
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        await connector._remove_deleted_from_table("kb_knowledge", "deletions", remove)
+        return connector.article_sync_point.update_sync_point
+
+    @pytest.mark.asyncio
+    async def test_audit_pass_keeps_the_watermark_at_the_failed_row(self, servicenow_connector):
+        async def remove(sys_id):
+            if sys_id == "art2":
+                raise RuntimeError("graph unavailable")
+            return 1
+
+        upd = await self._audit_run(servicenow_connector, [
+            {"documentkey": "art1", "sys_created_on": "2026-08-27 09:00:00"},
+            {"documentkey": "art2", "sys_created_on": "2026-08-27 10:00:00"},
+            {"documentkey": "art3", "sys_created_on": "2026-08-27 11:00:00"},
+        ], remove)
+
+        # art1 was dealt with, art2 was not: the watermark stays on art1 so art2
+        # and art3 are read again.
+        upd.assert_awaited_once_with("deletions", {"last_sync_time": "2026-08-27 09:00:00"})
+
+    @pytest.mark.asyncio
+    async def test_audit_pass_writes_nothing_when_the_first_row_fails(self, servicenow_connector):
+        async def remove(sys_id):
+            raise RuntimeError("graph unavailable")
+
+        upd = await self._audit_run(servicenow_connector, [
+            {"documentkey": "art1", "sys_created_on": "2026-08-27 09:00:00"},
+        ], remove)
+
+        upd.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unpublished_pass_keeps_the_watermark_at_the_failed_row(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        async def _respond(**kwargs):
+            if kwargs.get("sysparm_fields") == "sys_id,workflow_state,active":
+                return _table_api_response([
+                    {"sys_id": "art1", "workflow_state": "outdated", "active": "true",
+                     "sys_updated_on": "2026-08-27 09:00:00"},
+                    {"sys_id": "art2", "workflow_state": "outdated", "active": "true",
+                     "sys_updated_on": "2026-08-27 10:00:00"},
+                ])
+            return _table_api_response([])
+
+        calls = []
+
+        async def cascade(ids, connector_id):
+            calls.append(ids)
+            if len(calls) == 2:
+                raise RuntimeError("graph unavailable")
+            return {"deleted_records": ids}
+
+        record = MagicMock()
+        record.id = "rec"
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=record)
+        mock_data_entities_processor.on_records_deleted_cascade = AsyncMock(side_effect=cascade)
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        servicenow_connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        removed, newest = await servicenow_connector._remove_unpublished_articles(None)
+
+        assert removed == 1
+        assert newest == "2026-08-27 09:00:00"
+
+
+class TestDetachedAttachmentScope:
+    @pytest.mark.asyncio
+    async def test_only_attachment_records_are_considered(self, servicenow_connector,
+                                                          mock_data_entities_processor):
+        """Without the record-type filter this deletes every child of the
+        article whose id is not an attachment id."""
+        mock_data_entities_processor.get_records_by_parent = AsyncMock(return_value=[])
+
+        await servicenow_connector._remove_detached_attachments("art1", [])
+
+        assert mock_data_entities_processor.get_records_by_parent.await_args.args[2] == "FILE"
+
+
 class TestArticleWatermarkAdvance:
     """The indexing query only sees published rows. A sync that removed records
     but indexed nothing therefore left the watermark where it was, and read the
@@ -3190,9 +3286,11 @@ class TestDeletedRecordGroupRemoval:
                     return _table_api_response(rows)
             return _table_api_response([])
 
-        connector.article_sync_point = AsyncMock()
-        connector.article_sync_point.read_sync_point = AsyncMock(return_value=None)
-        connector.article_sync_point.update_sync_point = AsyncMock()
+        # Group deletions keep their watermark on the record-group sync point,
+        # not the records one.
+        connector.category_sync_point = AsyncMock()
+        connector.category_sync_point.read_sync_point = AsyncMock(return_value=None)
+        connector.category_sync_point.update_sync_point = AsyncMock()
         mock_ds = AsyncMock()
         mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
         connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
@@ -3242,7 +3340,7 @@ class TestDeletedRecordGroupRemoval:
             "kb_category": [{"documentkey": "cat1", "sys_created_on": "2026-08-27 12:30:00"}],
         })
 
-        keys = [c.args[0] for c in servicenow_connector.article_sync_point.update_sync_point.await_args_list]
+        keys = [c.args[0] for c in servicenow_connector.category_sync_point.update_sync_point.await_args_list]
         # One watermark shared between two independent reads would let whichever
         # ran second hide the rows the first had not reached.
         assert sorted(keys) == ["category_deletions", "kb_deletions"]
