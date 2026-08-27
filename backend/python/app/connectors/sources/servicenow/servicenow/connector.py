@@ -2122,6 +2122,7 @@ class ServiceNowConnector(BaseConnector):
                     break
 
             total_articles_removed = await self._remove_unpublished_articles(last_sync_time)
+            total_articles_removed += await self._remove_deleted_articles()
 
             # Update sync checkpoint
             if latest_update_time:
@@ -2137,6 +2138,97 @@ class ServiceNowConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"❌ Error syncing articles: {e}", exc_info=True)
             raise
+
+    async def _remove_deleted_articles(self) -> int:
+        """Delete the records of articles that were removed from kb_knowledge.
+
+        A deleted row leaves nothing behind in kb_knowledge, so the unpublished
+        pass cannot see it. ServiceNow records the deletion in sys_audit_delete
+        instead, keyed by the sys_id in ``documentkey`` — the only trace an
+        integration can read.
+
+        The table is not always readable by a least-privilege integration user.
+        That is treated as "this instance cannot report deletions", not as a
+        sync failure: the alternative is refusing to sync at all.
+
+        Keeps its own sync point. The articles watermark is the newest
+        sys_updated_on of a published article, which says nothing about how far
+        this table has been read: reusing it would skip every deletion older
+        than that timestamp, and skip it permanently, because the watermark only
+        moves forward. The two are not even the same field of the same table.
+        The watermark advances only after a clean pass, so a page that fails
+        leaves the deletion to be found next time.
+
+        Returns the number of records deleted.
+        """
+        last_sync_data = await self.article_sync_point.read_sync_point(
+            ServiceNowSyncPointKeys.DELETIONS
+        )
+        last_sync_time = (
+            last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None
+        )
+
+        query = f"{ServiceNowFields.TABLENAME}={ServiceNowTables.KB_KNOWLEDGE}"
+        if last_sync_time:
+            query += f"^{ServiceNowFields.SYS_CREATED_ON}>{last_sync_time}"
+        query += f"^{ServiceNowQueryValues.ORDER_BY_CREATED}"
+
+        batch_size = ServiceNowDefaults.BATCH_SIZE
+        offset = ServiceNowDefaults.PAGINATION_OFFSET
+        removed = 0
+        latest_delete_time = None
+
+        while True:
+            datasource = await self._get_fresh_datasource()
+            try:
+                response = await datasource.get_now_table_tableName(
+                    tableName=ServiceNowTables.SYS_AUDIT_DELETE,
+                    sysparm_query=query,
+                    sysparm_fields=CommonStrings.COMMA.join(
+                        [ServiceNowFields.DOCUMENTKEY, ServiceNowFields.SYS_CREATED_ON]
+                    ),
+                    sysparm_limit=str(batch_size),
+                    sysparm_offset=str(offset),
+                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                    sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                )
+            except ServiceNowAPIError as e:
+                self.logger.warning(
+                    f"Cannot read {ServiceNowTables.SYS_AUDIT_DELETE}, so deleted articles keep "
+                    f"their records: {e.message} (status: {e.status_code})"
+                )
+                return removed
+
+            rows = response.result
+            if not rows:
+                break
+
+            latest_delete_time = rows[-1].get(ServiceNowFields.SYS_CREATED_ON) or latest_delete_time
+
+            for row in rows:
+                sys_id = row.get(ServiceNowFields.DOCUMENTKEY)
+                if not sys_id:
+                    continue
+                try:
+                    removed += await self._remove_article_records(sys_id)
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Failed to remove records for deleted article {sys_id}: {e}",
+                        exc_info=True,
+                    )
+
+            offset += batch_size
+            if len(rows) < batch_size:
+                break
+
+        if latest_delete_time:
+            await self.article_sync_point.update_sync_point(
+                ServiceNowSyncPointKeys.DELETIONS,
+                {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_delete_time},
+            )
+
+        return removed
 
     async def _remove_unpublished_articles(self, last_sync_time: Optional[str]) -> int:
         """Delete the records of articles that are no longer published.
