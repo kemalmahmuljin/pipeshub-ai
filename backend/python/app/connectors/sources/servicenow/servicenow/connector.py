@@ -2153,7 +2153,12 @@ class ServiceNowConnector(BaseConnector):
                 if len(articles_data) < batch_size:
                     break
 
-            total_articles_removed = await self._remove_unpublished_articles(last_sync_time)
+            total_articles_removed, newest_row_seen = await self._remove_unpublished_articles(last_sync_time)
+            # The indexing query only sees published rows, so a sync that removed
+            # records but indexed nothing would leave the watermark where it was
+            # and read the same window again next time.
+            if newest_row_seen and (not latest_update_time or newest_row_seen > latest_update_time):
+                latest_update_time = newest_row_seen
             total_articles_removed += await self._remove_deleted_articles()
 
             # Update sync checkpoint
@@ -2332,7 +2337,9 @@ class ServiceNowConnector(BaseConnector):
 
         return removed
 
-    async def _remove_unpublished_articles(self, last_sync_time: Optional[str]) -> int:
+    async def _remove_unpublished_articles(
+        self, last_sync_time: Optional[str]
+    ) -> Tuple[int, Optional[str]]:
         """Delete the records of articles that are no longer published.
 
         A separate pass, with its own projection, because it reads rows the
@@ -2343,7 +2350,9 @@ class ServiceNowConnector(BaseConnector):
         fetching article bodies for them would dominate the sync. Only the three
         fields the decision needs are read.
 
-        Returns the number of records deleted.
+        Returns the number of records deleted, and the newest sys_updated_on it
+        read — or None if a page failed, so the caller does not move the
+        watermark past rows nobody looked at.
         """
         query = (
             f"{ServiceNowFields.SYS_UPDATED_ON}>{last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
@@ -2354,6 +2363,7 @@ class ServiceNowConnector(BaseConnector):
         batch_size = ServiceNowDefaults.BATCH_SIZE
         offset = ServiceNowDefaults.PAGINATION_OFFSET
         removed = 0
+        newest_seen = None
 
         while True:
             datasource = await self._get_fresh_datasource()
@@ -2378,11 +2388,13 @@ class ServiceNowConnector(BaseConnector):
                 # Every deletion here is driven by a row that was actually read,
                 # so a short list removes fewer records — it never invents one.
                 self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
-                break
+                return removed, None
 
             rows = response.result
             if not rows:
                 break
+
+            newest_seen = rows[-1].get(ServiceNowFields.SYS_UPDATED_ON) or newest_seen
 
             for row in rows:
                 if not self._article_left_published_set(row):
@@ -2399,7 +2411,7 @@ class ServiceNowConnector(BaseConnector):
             if len(rows) < batch_size:
                 break
 
-        return removed
+        return removed, newest_seen
 
     def _article_left_published_set(self, article_data: TableAPIRecord) -> bool:
         """Whether the row says ServiceNow stopped publishing this article.
