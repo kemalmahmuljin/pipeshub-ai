@@ -3052,6 +3052,50 @@ class TestSyncArticlesRemovesUnpublished:
         assert "text" not in removal[0]["sysparm_fields"].split(",")
 
 
+class TestArticleWatermarkAdvance:
+    """The indexing query only sees published rows. A sync that removed records
+    but indexed nothing therefore left the watermark where it was, and read the
+    same window again on every following delta."""
+
+    async def _sync(self, connector, rows, *, fail_removal=False):
+        async def _respond(**kwargs):
+            fields = kwargs.get("sysparm_fields", "")
+            if kwargs.get("tableName") == "sys_audit_delete":
+                return _table_api_response([])
+            if fields == "sys_id,workflow_state,active":
+                if fail_removal:
+                    raise ServiceNowAPIError(500, "boom", None)
+                return _table_api_response(rows)
+            return _table_api_response([])
+
+        connector.article_sync_point = AsyncMock()
+        connector.article_sync_point.read_sync_point = AsyncMock(
+            return_value={"last_sync_time": "2026-08-27 09:00:00"}
+        )
+        connector.article_sync_point.update_sync_point = AsyncMock()
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        await connector._sync_articles()
+        return connector.article_sync_point.update_sync_point
+
+    @pytest.mark.asyncio
+    async def test_a_removal_only_sync_still_moves_the_watermark(self, servicenow_connector):
+        upd = await self._sync(servicenow_connector, [
+            {"sys_id": "art1", "workflow_state": "outdated", "active": "true",
+             "sys_updated_on": "2026-08-27 09:38:57"},
+        ])
+        calls = {c.args[0]: c.args[1] for c in upd.await_args_list}
+        assert calls["articles"]["last_sync_time"] == "2026-08-27 09:38:57"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_removal_pass_does_not_move_it(self, servicenow_connector):
+        """Advancing on a page that was never read would skip the retirements it
+        held, and a watermark only moves forward."""
+        upd = await self._sync(servicenow_connector, [], fail_removal=True)
+        assert "articles" not in {c.args[0] for c in upd.await_args_list}
+
+
 class TestDeletedRecordGroupRemoval:
     """Deleting a knowledge base or a category leaves its record group behind,
     with its permission edges. Same reasoning as for articles: the row is gone,
