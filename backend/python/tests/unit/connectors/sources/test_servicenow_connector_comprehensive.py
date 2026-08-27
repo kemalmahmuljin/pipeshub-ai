@@ -736,6 +736,7 @@ class TestRunSyncComprehensive:
         connector._sync_knowledge_bases = AsyncMock()
         connector._sync_categories = AsyncMock()
         connector._sync_articles = AsyncMock()
+        connector._remove_deleted_record_groups = AsyncMock()
 
         await connector.run_sync()
 
