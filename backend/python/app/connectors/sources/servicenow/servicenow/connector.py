@@ -17,7 +17,7 @@ Synced Entities:
 import uuid
 from collections import defaultdict
 from logging import Logger
-from typing import Any, AsyncGenerator, Dict, List, NoReturn, Optional, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -507,6 +507,11 @@ class ServiceNowConnector(BaseConnector):
             # Step 5: Articles & Attachments
             self.logger.info("Step 5/5: Syncing Articles & Attachments...")
             await self._sync_articles()
+
+            # After the articles: deleting a knowledge base in ServiceNow deletes
+            # its articles too, and their records have to go before the group
+            # that holds them.
+            await self._remove_deleted_record_groups()
 
             self.logger.info("🎉 ServiceNow KB sync completed successfully")
 
@@ -2191,14 +2196,54 @@ class ServiceNowConnector(BaseConnector):
 
         Returns the number of records deleted.
         """
-        last_sync_data = await self.article_sync_point.read_sync_point(
-            ServiceNowSyncPointKeys.DELETIONS
+        return await self._remove_deleted_from_table(
+            ServiceNowTables.KB_KNOWLEDGE,
+            ServiceNowSyncPointKeys.DELETIONS,
+            self._remove_article_records,
         )
+
+    async def _remove_deleted_record_groups(self) -> int:
+        """Delete the record groups of knowledge bases and categories that were
+        removed from ServiceNow.
+
+        Same reasoning as for articles: the row is gone, so only
+        sys_audit_delete says it existed. Each table keeps its own sync point,
+        since each is read independently.
+
+        Returns the number of record groups deleted.
+        """
+        removed = 0
+        for table, key in (
+            (ServiceNowTables.KB_KNOWLEDGE_BASE, ServiceNowSyncPointKeys.KB_DELETIONS),
+            (ServiceNowTables.KB_CATEGORY, ServiceNowSyncPointKeys.CATEGORY_DELETIONS),
+        ):
+            removed += await self._remove_deleted_from_table(
+                table, key, self._remove_record_group
+            )
+        return removed
+
+    async def _remove_record_group(self, external_group_id: str) -> int:
+        """Delete one record group. Returns 1 if it existed, 0 otherwise."""
+        deleted = await self.data_entities_processor.on_record_group_deleted(
+            external_group_id, self.connector_id
+        )
+        if deleted:
+            self.logger.info(f"🗑️ Removed record group {external_group_id}")
+        return 1 if deleted else 0
+
+    async def _remove_deleted_from_table(
+        self,
+        table: str,
+        sync_key: str,
+        remove: Callable[[str], Awaitable[int]],
+    ) -> int:
+        """Read sys_audit_delete for one table and remove what it reports gone."""
+        last_sync_data = await self.article_sync_point.read_sync_point(sync_key)
         last_sync_time = (
             last_sync_data.get(ServiceNowSyncPointKeys.LAST_SYNC_TIME) if last_sync_data else None
         )
 
-        query = f"{ServiceNowFields.TABLENAME}={ServiceNowTables.KB_KNOWLEDGE}"
+        query = f"{ServiceNowFields.TABLENAME}={table}"
         if last_sync_time:
             query += f"^{ServiceNowFields.SYS_CREATED_ON}>{last_sync_time}"
         query += f"^{ServiceNowQueryValues.ORDER_BY_CREATED}"
@@ -2225,7 +2270,7 @@ class ServiceNowConnector(BaseConnector):
                 )
             except ServiceNowAPIError as e:
                 self.logger.warning(
-                    f"Cannot read {ServiceNowTables.SYS_AUDIT_DELETE}, so deleted articles keep "
+                    f"Cannot read {ServiceNowTables.SYS_AUDIT_DELETE}, so {table} deletions keep "
                     f"their records: {e.message} (status: {e.status_code})"
                 )
                 return removed
@@ -2241,10 +2286,10 @@ class ServiceNowConnector(BaseConnector):
                 if not sys_id:
                     continue
                 try:
-                    removed += await self._remove_article_records(sys_id)
+                    removed += await remove(sys_id)
                 except Exception as e:
                     self.logger.error(
-                        f"❌ Failed to remove records for deleted article {sys_id}: {e}",
+                        f"❌ Failed to remove records for deleted {table} row {sys_id}: {e}",
                         exc_info=True,
                     )
 
@@ -2254,7 +2299,7 @@ class ServiceNowConnector(BaseConnector):
 
         if latest_delete_time:
             await self.article_sync_point.update_sync_point(
-                ServiceNowSyncPointKeys.DELETIONS,
+                sync_key,
                 {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_delete_time},
             )
 

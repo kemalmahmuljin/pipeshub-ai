@@ -167,6 +167,8 @@ class ServiceNowSyncPointKeys:
     CATEGORIES = "categories"
     ARTICLES = "articles"
     DELETIONS = "deletions"
+    KB_DELETIONS = "kb_deletions"
+    CATEGORY_DELETIONS = "category_deletions"
     LAST_SYNC_TIME = "last_sync_time"
 
 

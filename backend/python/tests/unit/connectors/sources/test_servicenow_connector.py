@@ -953,7 +953,8 @@ class TestRunSync:
              patch.object(servicenow_connector, "_get_admin_users", new_callable=AsyncMock, return_value=[]), \
              patch.object(servicenow_connector, "_sync_knowledge_bases", new_callable=AsyncMock), \
              patch.object(servicenow_connector, "_sync_categories", new_callable=AsyncMock), \
-             patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock):
+             patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock), \
+             patch.object(servicenow_connector, "_remove_deleted_record_groups", new_callable=AsyncMock):
             await servicenow_connector.run_sync()
 
     async def test_sync_continues_without_admin_users(self, servicenow_connector):
@@ -962,7 +963,8 @@ class TestRunSync:
              patch.object(servicenow_connector, "_get_admin_users", new_callable=AsyncMock, return_value=[]), \
              patch.object(servicenow_connector, "_sync_knowledge_bases", new_callable=AsyncMock) as mock_kb, \
              patch.object(servicenow_connector, "_sync_categories", new_callable=AsyncMock), \
-             patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock):
+             patch.object(servicenow_connector, "_sync_articles", new_callable=AsyncMock), \
+             patch.object(servicenow_connector, "_remove_deleted_record_groups", new_callable=AsyncMock):
             await servicenow_connector.run_sync()
             mock_kb.assert_called_once_with([])
 
@@ -3048,6 +3050,81 @@ class TestSyncArticlesRemovesUnpublished:
         # Versioning makes retired rows outnumber published ones, so pulling
         # their bodies would dominate the sync.
         assert "text" not in removal[0]["sysparm_fields"].split(",")
+
+
+class TestDeletedRecordGroupRemoval:
+    """Deleting a knowledge base or a category leaves its record group behind,
+    with its permission edges. Same reasoning as for articles: the row is gone,
+    so only sys_audit_delete says it existed."""
+
+    async def _run(self, connector, rows_by_table):
+        seen = []
+
+        async def _respond(**kwargs):
+            if kwargs.get("tableName") != "sys_audit_delete":
+                return _table_api_response([])
+            seen.append(kwargs["sysparm_query"])
+            for table, rows in rows_by_table.items():
+                if f"tablename={table}" in kwargs["sysparm_query"]:
+                    return _table_api_response(rows)
+            return _table_api_response([])
+
+        connector.article_sync_point = AsyncMock()
+        connector.article_sync_point.read_sync_point = AsyncMock(return_value=None)
+        connector.article_sync_point.update_sync_point = AsyncMock()
+        mock_ds = AsyncMock()
+        mock_ds.get_now_table_tableName = AsyncMock(side_effect=_respond)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        removed = await connector._remove_deleted_record_groups()
+        return removed, seen
+
+    @pytest.mark.asyncio
+    async def test_both_group_tables_are_read(self, servicenow_connector):
+        _, seen = await self._run(servicenow_connector, {})
+        assert any("tablename=kb_knowledge_base" in q for q in seen)
+        assert any("tablename=kb_category" in q for q in seen)
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_knowledge_base_loses_its_record_group(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        mock_data_entities_processor.on_record_group_deleted = AsyncMock(return_value=True)
+
+        removed, _ = await self._run(servicenow_connector, {
+            "kb_knowledge_base": [{"documentkey": "kb1", "sys_created_on": "2026-08-27 12:00:00"}],
+        })
+
+        assert removed == 1
+        mock_data_entities_processor.on_record_group_deleted.assert_awaited_once_with(
+            "kb1", servicenow_connector.connector_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_group_that_was_never_synced_counts_as_nothing(
+        self, servicenow_connector, mock_data_entities_processor
+    ):
+        mock_data_entities_processor.on_record_group_deleted = AsyncMock(return_value=False)
+
+        removed, _ = await self._run(servicenow_connector, {
+            "kb_category": [{"documentkey": "cat1", "sys_created_on": "2026-08-27 12:00:00"}],
+        })
+
+        assert removed == 0
+
+    @pytest.mark.asyncio
+    async def test_each_table_keeps_its_own_sync_point(self, servicenow_connector,
+                                                       mock_data_entities_processor):
+        mock_data_entities_processor.on_record_group_deleted = AsyncMock(return_value=True)
+
+        await self._run(servicenow_connector, {
+            "kb_knowledge_base": [{"documentkey": "kb1", "sys_created_on": "2026-08-27 12:00:00"}],
+            "kb_category": [{"documentkey": "cat1", "sys_created_on": "2026-08-27 12:30:00"}],
+        })
+
+        keys = [c.args[0] for c in servicenow_connector.article_sync_point.update_sync_point.await_args_list]
+        # One watermark shared between two independent reads would let whichever
+        # ran second hide the rows the first had not reached.
+        assert sorted(keys) == ["category_deletions", "kb_deletions"]
 
 
 class TestDetachedAttachmentRemoval:
