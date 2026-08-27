@@ -2121,6 +2121,8 @@ class ServiceNowConnector(BaseConnector):
                 if len(articles_data) < batch_size:
                     break
 
+            total_articles_removed = await self._remove_unpublished_articles(last_sync_time)
+
             # Update sync checkpoint
             if latest_update_time:
                 await self.article_sync_point.update_sync_point(ServiceNowSyncPointKeys.ARTICLES, {ServiceNowSyncPointKeys.LAST_SYNC_TIME: latest_update_time})
@@ -2128,12 +2130,124 @@ class ServiceNowConnector(BaseConnector):
             self.logger.info(
                 f"✅ Articles synced: {total_articles_synced} articles, "
                 f"{total_attachments_synced} attachments, "
-                f"{total_records_dropped} record(s) dropped without permissions"
+                f"{total_records_dropped} record(s) dropped without permissions, "
+                f"{total_articles_removed} record(s) removed for unpublished articles"
             )
 
         except Exception as e:
             self.logger.error(f"❌ Error syncing articles: {e}", exc_info=True)
             raise
+
+    async def _remove_unpublished_articles(self, last_sync_time: Optional[str]) -> int:
+        """Delete the records of articles that are no longer published.
+
+        A separate pass, with its own projection, because it reads rows the
+        indexing query filters out. ServiceNow has no change feed, so a retired
+        article is only ever visible as a row saying it is retired — never as an
+        event. Knowledge versioning retires the previous row on every edit, so
+        these rows outnumber the published ones on an instance with history, and
+        fetching article bodies for them would dominate the sync. Only the three
+        fields the decision needs are read.
+
+        Returns the number of records deleted.
+        """
+        query = (
+            f"{ServiceNowFields.SYS_UPDATED_ON}>{last_sync_time}^{ServiceNowQueryValues.ORDER_BY_UPDATED}"
+            if last_sync_time
+            else ServiceNowQueryValues.ORDER_BY_UPDATED
+        )
+
+        batch_size = ServiceNowDefaults.BATCH_SIZE
+        offset = ServiceNowDefaults.PAGINATION_OFFSET
+        removed = 0
+
+        while True:
+            datasource = await self._get_fresh_datasource()
+            try:
+                response = await datasource.get_now_table_tableName(
+                    tableName=ServiceNowTables.KB_KNOWLEDGE,
+                    sysparm_query=query,
+                    sysparm_fields=CommonStrings.COMMA.join(
+                        [
+                            ServiceNowFields.SYS_ID,
+                            ServiceNowFields.WORKFLOW_STATE,
+                            ServiceNowFields.ACTIVE,
+                        ]
+                    ),
+                    sysparm_limit=str(batch_size),
+                    sysparm_offset=str(offset),
+                    sysparm_display_value=ServiceNowQueryValues.DISPLAY_VALUE_FALSE,
+                    sysparm_no_count=ServiceNowQueryValues.NO_COUNT_TRUE,
+                    sysparm_exclude_reference_link=ServiceNowQueryValues.EXCLUDE_REFERENCE_LINK_TRUE,
+                )
+            except ServiceNowAPIError as e:
+                # Every deletion here is driven by a row that was actually read,
+                # so a short list removes fewer records — it never invents one.
+                self.logger.error(f"❌ API error at offset {offset}: {e.message} (status: {e.status_code})")
+                break
+
+            rows = response.result
+            if not rows:
+                break
+
+            for row in rows:
+                if not self._article_left_published_set(row):
+                    continue
+                try:
+                    removed += await self._remove_article_records(row.sys_id)
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Failed to remove records for article {row.get(ServiceNowFields.SYS_ID)}: {e}",
+                        exc_info=True,
+                    )
+
+            offset += batch_size
+            if len(rows) < batch_size:
+                break
+
+        return removed
+
+    def _article_left_published_set(self, article_data: TableAPIRecord) -> bool:
+        """Whether the row says ServiceNow stopped publishing this article.
+
+        Knowledge versioning retires the old row on every edit, so this is
+        routine rather than exceptional. A missing or empty field is not taken
+        as evidence: deleting a record is irreversible for the user, so it needs
+        a value that positively says the article left the set.
+        """
+        # .get, not attribute access: TableAPIRecord raises AttributeError for a
+        # field the response did not carry.
+        state = str(article_data.get(ServiceNowFields.WORKFLOW_STATE) or "").strip().lower()
+        if state and state != ServiceNowFields.PUBLISHED:
+            return True
+        active = str(article_data.get(ServiceNowFields.ACTIVE) or "").strip().lower()
+        return bool(active) and active != "true"
+
+    async def _remove_article_records(self, article_sys_id: str) -> int:
+        """Delete the record for an article that is no longer published.
+
+        Uses the cascade path rather than ``on_record_deleted``: it takes the
+        attachments with the article as part of the containment subtree, and it
+        removes the edges and the type document too. ``on_record_deleted``
+        detaches only the incoming PARENT_CHILD edge, which leaves roughly
+        eighteen dangling edges and an orphaned webpages document per record.
+
+        Returns the number of records deleted.
+        """
+        record = await self.data_entities_processor.get_record_by_external_id(
+            self.connector_id, article_sys_id
+        )
+        if record is None:
+            return 0
+
+        result = await self.data_entities_processor.on_records_deleted_cascade(
+            [record.id], self.connector_id
+        )
+        deleted = len((result or {}).get("deleted_records") or [])
+        self.logger.info(
+            f"🗑️ Removed {deleted} record(s) for unpublished article {article_sys_id}"
+        )
+        return deleted
 
     async def _process_single_article(
         self, article_data: TableAPIRecord
